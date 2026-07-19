@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"time"
 )
 
@@ -16,6 +17,19 @@ type Client struct {
 	HTTPClient  *http.Client
 	AccessToken string
 	Endpoint    string
+}
+
+type Error struct {
+	Status     int
+	Message    string
+	RetryAfter time.Duration
+}
+
+func (e *Error) Error() string {
+	if e.Message != "" {
+		return e.Message
+	}
+	return fmt.Sprintf("AniList HTTP %d", e.Status)
 }
 
 type graphQLError struct {
@@ -105,7 +119,11 @@ func (c *Client) do(ctx context.Context, query string, variables map[string]any,
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("call AniList: HTTP %d", resp.StatusCode)
+		retryAfter := time.Duration(0)
+		if seconds, parseErr := strconv.Atoi(resp.Header.Get("Retry-After")); parseErr == nil && seconds > 0 {
+			retryAfter = time.Duration(seconds) * time.Second
+		}
+		return &Error{Status: resp.StatusCode, RetryAfter: retryAfter}
 	}
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
 	if err != nil {
@@ -118,7 +136,7 @@ func (c *Client) do(ctx context.Context, query string, variables map[string]any,
 		return fmt.Errorf("decode AniList response: %w", err)
 	}
 	if len(envelope.Errors) > 0 {
-		return fmt.Errorf("AniList GraphQL: %s", envelope.Errors[0].Message)
+		return &Error{Status: resp.StatusCode, Message: "AniList GraphQL: " + envelope.Errors[0].Message}
 	}
 	if err := json.Unmarshal(raw, out); err != nil {
 		return fmt.Errorf("decode AniList response data: %w", err)

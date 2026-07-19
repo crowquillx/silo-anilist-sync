@@ -2,32 +2,76 @@ package main
 
 import (
 	"context"
+	"net/url"
 	"testing"
 
 	pluginv1 "github.com/Silo-Server/silo-plugin-sdk/pkg/pluginproto/silo/plugin/v1"
-	"google.golang.org/protobuf/types/known/structpb"
+	"github.com/crowquillx/silo-anilist-sync/mapping"
 )
 
-func TestConfigure(t *testing.T) {
-	account, _ := structpb.NewStruct(map[string]any{"access_token": " anilist ", "profile_id": "p1"})
-	siloConfig, _ := structpb.NewStruct(map[string]any{"api_key": " silo ", "base_url": "http://silo/"})
+func TestInitAuthorizeUsesHostStateAndRedirect(t *testing.T) {
 	s := &server{}
-	_, err := s.Configure(context.Background(), &pluginv1.ConfigureRequest{Config: []*pluginv1.ConfigEntry{
-		{Key: "account", Value: account},
-		{Key: "silo", Value: siloConfig},
-	}})
+	resp, err := s.InitAuthorize(context.Background(), &pluginv1.WatchSyncInitAuthorizeRequest{
+		ProviderConfig: &pluginv1.WatchSyncProviderConfig{Values: map[string]string{"client_id": "123"}},
+		RedirectUri:    "https://silo.example/api/v1/watch-providers/oauth/callback",
+		State:          "host-state",
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if s.config.AniListToken != "anilist" || s.config.SiloAPIKey != "silo" || s.config.SiloBaseURL != "http://silo" {
-		t.Fatalf("config = %#v", s.config)
+	if resp.GetFault() != nil {
+		t.Fatalf("fault = %#v", resp.GetFault())
+	}
+	parsed, err := url.Parse(resp.GetAuthorizationUrl())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if parsed.Query().Get("client_id") != "123" || parsed.Query().Get("state") != "host-state" || parsed.Query().Get("response_type") != "code" {
+		t.Fatalf("authorization query = %v", parsed.Query())
 	}
 }
 
-func TestHandleEventIgnoresNonWatchedChanges(t *testing.T) {
-	payload, _ := structpb.NewStruct(map[string]any{"change": "progress", "profile_id": "p1", "content_id": "e1"})
-	s := &server{}
-	if _, err := s.HandleEvent(context.Background(), &pluginv1.HandleEventRequest{EventName: "user_state.changed", Payload: payload}); err != nil {
+func TestResolveTargetsRequiresProviderConvergence(t *testing.T) {
+	dataset := mapping.Dataset{
+		"tvdb_show:1:s1": {"anilist:10": {"1-12": "1-12"}},
+		"tmdb_show:2:s1": {"anilist:11": {"1-12": "1-12"}},
+	}
+	_, err := resolveTargets(dataset, &pluginv1.WatchSyncMedia{
+		MediaType:         "episode",
+		SeasonNumber:      1,
+		EpisodeNumber:     3,
+		SeriesExternalIds: map[string]string{"tvdb": "1", "tmdb": "2"},
+	})
+	if err == nil {
+		t.Fatal("expected disagreeing mappings to fail")
+	}
+}
+
+func TestResolveTargetsMapsEpisode(t *testing.T) {
+	dataset := mapping.Dataset{
+		"tvdb_show:1:s1": {"anilist:10": {"1-12": "1-12"}},
+		"tmdb_show:2:s1": {"anilist:10": {"1-12": "1-12"}},
+	}
+	targets, err := resolveTargets(dataset, &pluginv1.WatchSyncMedia{
+		MediaType:         "episode",
+		SeasonNumber:      1,
+		EpisodeNumber:     3,
+		SeriesExternalIds: map[string]string{"tvdb": "1", "tmdb": "2"},
+	})
+	if err != nil {
 		t.Fatal(err)
+	}
+	if targets[10] != 3 {
+		t.Fatalf("targets = %#v", targets)
+	}
+}
+
+func TestApplyEventRejectsUnwatch(t *testing.T) {
+	result := applyEvent(context.Background(), nil, nil, &pluginv1.WatchSyncEvent{
+		EventId:   "event-1",
+		Operation: pluginv1.WatchSyncOperation_WATCH_SYNC_OPERATION_MARK_UNWATCHED,
+	})
+	if result.GetStatus() != pluginv1.WatchSyncApplyStatus_WATCH_SYNC_APPLY_STATUS_REJECTED {
+		t.Fatalf("status = %v", result.GetStatus())
 	}
 }

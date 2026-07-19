@@ -1,6 +1,6 @@
 {
   "plugin_id": "dev.crowquillx.anilist-sync",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "checksum": "__CHECKSUM__",
   "silo_api_version": "v1",
   "supported_platforms": [
@@ -10,49 +10,31 @@
   ],
   "capabilities": [
     {
-      "type": "event_consumer.v1",
-      "id": "anilist-sync",
-      "display_name": "AniList Sync",
-      "description": "Updates AniList progress when anime is marked watched in Silo.",
-      "subscriptions": ["user_state.changed"]
-    }
-  ],
-  "global_config_schema": [
-    {
-      "key": "account",
-      "title": "AniList account",
-      "description": "Connect the AniList account that should receive watched progress.",
-      "required": true,
-      "json_schema": "{\"type\":\"object\",\"properties\":{\"access_token\":{\"type\":\"string\"},\"profile_id\":{\"type\":\"string\"}},\"required\":[\"access_token\"],\"additionalProperties\":false}",
-      "admin_form": {
-        "fields": [
-          { "key": "access_token", "label": "AniList access token", "control": 3, "required": true, "secret": true },
-          { "key": "profile_id", "label": "Silo profile ID", "description": "Optional. Ignore watched events from other profiles.", "control": 1 }
+      "type": "watch_sync_provider.v1",
+      "id": "anilist",
+      "display_name": "AniList",
+      "description": "Synchronizes completed anime movies and episodes with AniList.",
+      "watch_sync_provider": {
+        "auth_methods": [
+          "WATCH_SYNC_AUTH_METHOD_AUTHORIZATION_CODE",
+          "WATCH_SYNC_AUTH_METHOD_API_KEY"
         ],
-        "submit_label": "Save AniList account"
-      }
-    },
-    {
-      "key": "silo",
-      "title": "Silo API access",
-      "description": "A Silo API key lets the plugin resolve watched item and episode metadata.",
-      "required": true,
-      "json_schema": "{\"type\":\"object\",\"properties\":{\"api_key\":{\"type\":\"string\"},\"base_url\":{\"type\":\"string\"}},\"required\":[\"api_key\"],\"additionalProperties\":false}",
-      "admin_form": {
-        "fields": [
-          { "key": "api_key", "label": "Silo API key", "control": 3, "required": true, "secret": true },
-          { "key": "base_url", "label": "Silo base URL", "description": "Optional. The plugin normally discovers this from Silo.", "control": 1, "placeholder": "http://silo:8080" }
-        ],
-        "submit_label": "Save Silo access"
+        "export_watched": true,
+        "export_unwatched": false,
+        "import_watched": false,
+        "import_progress": false,
+        "supported_media_types": ["movie", "episode"],
+        "external_id_namespaces": ["anilist", "imdb", "tmdb", "tvdb"],
+        "max_batch_size": 25
       }
     }
   ],
   "category": "Integrations/Tracking",
   "presentation": {
     "display_name": "AniList Sync",
-    "summary": "Update AniList episode progress when anime is marked watched in Silo.",
-    "description_markdown": "Consumes Silo watched-state events, resolves episode-level mappings with the daily AniBridge mapping dataset, and advances the configured AniList account without reducing existing progress.",
-    "setup_markdown": "1. Create an AniList OAuth access token.\n2. Create a Silo API key for the account that owns the profile.\n3. Configure both secrets above.\n4. Optionally set the Silo profile ID when the server has multiple profiles.\n\nThe current Silo plugin API provides configuration globally, so this release supports one AniList account per Silo server.",
+    "summary": "Reliably synchronize completed anime with AniList through Silo's watch-provider pipeline.",
+    "description_markdown": "Uses Silo's host-owned watch-sync pipeline for encrypted per-profile credentials, durable desired-state delivery, retries, and rich episode identity. Episode mappings come from the daily AniBridge v3 dataset. AniList progress is monotonic and ambiguous mappings are rejected rather than guessed.",
+    "setup_markdown": "Install the plugin, configure an AniList OAuth application in Silo's watch-provider administration page, then connect AniList from the desired profile. Silo stores credentials encrypted and invokes this plugin as a stateless provider adapter.",
     "homepage_url": "https://github.com/crowquillx/silo-anilist-sync",
     "source_url": "https://github.com/crowquillx/silo-anilist-sync",
     "support_url": "https://github.com/crowquillx/silo-anilist-sync/issues",
