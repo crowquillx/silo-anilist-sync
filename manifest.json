@@ -4,9 +4,18 @@
   "checksum": "__CHECKSUM__",
   "silo_api_version": "v1",
   "supported_platforms": [
-    { "os": "linux", "arch": "amd64" },
-    { "os": "linux", "arch": "arm64" },
-    { "os": "darwin", "arch": "arm64" }
+    {
+      "os": "linux",
+      "arch": "amd64"
+    },
+    {
+      "os": "linux",
+      "arch": "arm64"
+    },
+    {
+      "os": "darwin",
+      "arch": "arm64"
+    }
   ],
   "capabilities": [
     {
@@ -23,8 +32,16 @@
         "export_unwatched": false,
         "import_watched": false,
         "import_progress": false,
-        "supported_media_types": ["movie", "episode"],
-        "external_id_namespaces": ["anilist", "imdb", "tmdb", "tvdb"],
+        "supported_media_types": [
+          "WATCH_SYNC_MEDIA_TYPE_MOVIE",
+          "WATCH_SYNC_MEDIA_TYPE_EPISODE"
+        ],
+        "external_id_namespaces": [
+          "anilist",
+          "imdb",
+          "tmdb",
+          "tvdb"
+        ],
         "max_batch_size": 25
       }
     }

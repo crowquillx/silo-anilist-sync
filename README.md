@@ -2,12 +2,12 @@
 
 An AniList watch-sync provider for [Silo Server](https://github.com/Silo-Server/silo-server).
 
-> **Development status:** the `feat/watch-sync-provider` branch targets the new
-> `watch_sync_provider.v1` SDK contract proposed in
-> [Silo-Server/silo-plugin-sdk#10](https://github.com/Silo-Server/silo-plugin-sdk/pull/10).
-> It is not compatible with a stock Silo release until the corresponding SDK
-> and server support land. The v0.1.x releases use the legacy event-consumer
-> workaround and only observe explicit “mark watched” actions.
+> **Development status:** this branch targets the released
+> `watch_sync_provider.v1` contract in
+> [`silo-plugin-sdk` v0.12.0](https://github.com/Silo-Server/silo-plugin-sdk/releases/tag/v0.12.0).
+> It still requires Silo host support for plugin-backed watch providers, which
+> is not in a stock Silo release yet. The v0.1.x releases use the legacy
+> event-consumer workaround and only observe explicit “mark watched” actions.
 
 ## Architecture
 
@@ -57,13 +57,10 @@ persist or log them.
 
 ## Development
 
-Requires Go 1.26 and a workspace containing the SDK capability branch:
+Requires Go 1.26 and `silo-plugin-sdk` v0.12.0 or newer:
 
 ```fish
-cd /path/to/repos
-
-go work init ./silo-anilist-sync ./silo-plugin-sdk
-cd silo-anilist-sync
+cd /path/to/silo-anilist-sync
 CGO_ENABLED=0 go test ./...
 CGO_ENABLED=0 go build -o plugin .
 ./plugin manifest | jq

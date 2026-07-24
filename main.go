@@ -80,7 +80,7 @@ func (s *server) RefreshCredentials(context.Context, *pluginv1.WatchSyncRefreshC
 }
 
 func (s *server) GetAccount(ctx context.Context, req *pluginv1.WatchSyncGetAccountRequest) (*pluginv1.WatchSyncGetAccountResponse, error) {
-	account, err := anilist.NewClient(req.GetCredentials().GetAccessToken(), nil).Viewer(ctx)
+	account, err := anilist.NewClient(req.GetContext().GetCredentials().GetAccessToken(), nil).Viewer(ctx)
 	if err != nil {
 		return &pluginv1.WatchSyncGetAccountResponse{Fault: faultFromError(err)}, nil
 	}
@@ -95,7 +95,7 @@ func (s *server) ApplyEvents(ctx context.Context, req *pluginv1.WatchSyncApplyEv
 	if err != nil {
 		return &pluginv1.WatchSyncApplyEventsResponse{Fault: faultFromError(err)}, nil
 	}
-	client := anilist.NewClient(req.GetCredentials().GetAccessToken(), nil)
+	client := anilist.NewClient(req.GetContext().GetCredentials().GetAccessToken(), nil)
 	results := make([]*pluginv1.WatchSyncApplyResult, 0, len(req.GetEvents()))
 	for _, event := range req.GetEvents() {
 		results = append(results, applyEvent(ctx, client, dataset, event))
@@ -107,18 +107,27 @@ func applyEvent(ctx context.Context, client *anilist.Client, dataset mapping.Dat
 	result := &pluginv1.WatchSyncApplyResult{EventId: event.GetEventId()}
 	if event.GetOperation() != pluginv1.WatchSyncOperation_WATCH_SYNC_OPERATION_MARK_WATCHED {
 		result.Status = pluginv1.WatchSyncApplyStatus_WATCH_SYNC_APPLY_STATUS_REJECTED
-		result.SafeMessage = "AniList unwatch synchronization is not supported"
+		result.Fault = &pluginv1.WatchSyncFault{
+			Code:        pluginv1.WatchSyncFaultCode_WATCH_SYNC_FAULT_CODE_PERMANENT,
+			SafeMessage: "AniList unwatch synchronization is not supported",
+		}
 		return result
 	}
 	targets, err := resolveTargets(dataset, event.GetMedia())
 	if err != nil {
 		result.Status = pluginv1.WatchSyncApplyStatus_WATCH_SYNC_APPLY_STATUS_REJECTED
-		result.SafeMessage = err.Error()
+		result.Fault = &pluginv1.WatchSyncFault{
+			Code:        pluginv1.WatchSyncFaultCode_WATCH_SYNC_FAULT_CODE_INVALID_REQUEST,
+			SafeMessage: err.Error(),
+		}
 		return result
 	}
 	if len(targets) == 0 {
 		result.Status = pluginv1.WatchSyncApplyStatus_WATCH_SYNC_APPLY_STATUS_REJECTED
-		result.SafeMessage = "no unambiguous AniBridge mapping was found"
+		result.Fault = &pluginv1.WatchSyncFault{
+			Code:        pluginv1.WatchSyncFaultCode_WATCH_SYNC_FAULT_CODE_PERMANENT,
+			SafeMessage: "no unambiguous AniBridge mapping was found",
+		}
 		return result
 	}
 	ids := make([]int, 0, len(targets))
@@ -141,10 +150,15 @@ func resolveTargets(dataset mapping.Dataset, media *pluginv1.WatchSyncMedia) (ma
 	}
 	season, episode := int(media.GetSeasonNumber()), int(media.GetEpisodeNumber())
 	ids := media.GetSeriesExternalIds()
-	if media.GetMediaType() == "movie" {
+	switch media.GetMediaType() {
+	case pluginv1.WatchSyncMediaType_WATCH_SYNC_MEDIA_TYPE_MOVIE:
 		season, episode = -1, 1
 		ids = media.GetExternalIds()
-	} else if media.GetMediaType() != "episode" || season < 0 || episode < 1 {
+	case pluginv1.WatchSyncMediaType_WATCH_SYNC_MEDIA_TYPE_EPISODE:
+		if season < 0 || episode < 1 {
+			return nil, errors.New("episode watch events require season and episode numbers")
+		}
+	default:
 		return nil, fmt.Errorf("unsupported watch media type %q", media.GetMediaType())
 	}
 	return convergedMappings(dataset, ids, season, episode)
@@ -233,12 +247,13 @@ func providerCredentials(config *pluginv1.WatchSyncProviderConfig) (string, stri
 
 func applyErrorResult(eventID string, err error) *pluginv1.WatchSyncApplyResult {
 	fault := faultFromError(err)
-	result := &pluginv1.WatchSyncApplyResult{EventId: eventID, SafeMessage: fault.GetSafeMessage()}
-	if fault.GetCode() == pluginv1.WatchSyncFaultCode_WATCH_SYNC_FAULT_CODE_INVALID_REQUEST || fault.GetCode() == pluginv1.WatchSyncFaultCode_WATCH_SYNC_FAULT_CODE_PERMANENT {
+	result := &pluginv1.WatchSyncApplyResult{EventId: eventID, Fault: fault}
+	switch fault.GetCode() {
+	case pluginv1.WatchSyncFaultCode_WATCH_SYNC_FAULT_CODE_INVALID_REQUEST,
+		pluginv1.WatchSyncFaultCode_WATCH_SYNC_FAULT_CODE_PERMANENT:
 		result.Status = pluginv1.WatchSyncApplyStatus_WATCH_SYNC_APPLY_STATUS_REJECTED
-	} else {
+	default:
 		result.Status = pluginv1.WatchSyncApplyStatus_WATCH_SYNC_APPLY_STATUS_RETRY
-		result.RetryAfter = fault.GetRetryAfter()
 	}
 	return result
 }

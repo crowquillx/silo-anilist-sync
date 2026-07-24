@@ -37,7 +37,7 @@ func TestResolveTargetsRequiresProviderConvergence(t *testing.T) {
 		"tmdb_show:2:s1": {"anilist:11": {"1-12": "1-12"}},
 	}
 	_, err := resolveTargets(dataset, &pluginv1.WatchSyncMedia{
-		MediaType:         "episode",
+		MediaType:         pluginv1.WatchSyncMediaType_WATCH_SYNC_MEDIA_TYPE_EPISODE,
 		SeasonNumber:      1,
 		EpisodeNumber:     3,
 		SeriesExternalIds: map[string]string{"tvdb": "1", "tmdb": "2"},
@@ -53,7 +53,7 @@ func TestResolveTargetsMapsEpisode(t *testing.T) {
 		"tmdb_show:2:s1": {"anilist:10": {"1-12": "1-12"}},
 	}
 	targets, err := resolveTargets(dataset, &pluginv1.WatchSyncMedia{
-		MediaType:         "episode",
+		MediaType:         pluginv1.WatchSyncMediaType_WATCH_SYNC_MEDIA_TYPE_EPISODE,
 		SeasonNumber:      1,
 		EpisodeNumber:     3,
 		SeriesExternalIds: map[string]string{"tvdb": "1", "tmdb": "2"},
