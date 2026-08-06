@@ -50,11 +50,91 @@ type mediaResponse struct {
 	Errors []graphQLError `json:"errors"`
 }
 
+type ListEntry struct {
+	ID       int
+	MediaID  int
+	Status   string
+	Progress int
+	Media    struct {
+		ID       int
+		Format   string
+		Episodes *int
+		Title    struct {
+			Romaji  string `json:"romaji"`
+			English string `json:"english"`
+			Native  string `json:"native"`
+		} `json:"title"`
+		StartDate struct {
+			Year int `json:"year"`
+		} `json:"startDate"`
+	} `json:"media"`
+}
+
+func (e ListEntry) PreferredTitle() string {
+	for _, title := range []string{e.Media.Title.English, e.Media.Title.Romaji, e.Media.Title.Native} {
+		if title != "" {
+			return title
+		}
+	}
+	return ""
+}
+
+func (e ListEntry) CompletedProgress() int {
+	progress := e.Progress
+	if e.Status == "COMPLETED" && e.Media.Episodes != nil && *e.Media.Episodes > progress {
+		progress = *e.Media.Episodes
+	}
+	if e.Status == "COMPLETED" && e.Media.Format == "MOVIE" && progress < 1 {
+		progress = 1
+	}
+	return progress
+}
+
+type ListPage struct {
+	Entries     []ListEntry
+	HasNextPage bool
+}
+
 func NewClient(token string, httpClient *http.Client) *Client {
 	if httpClient == nil {
 		httpClient = &http.Client{Timeout: 15 * time.Second}
 	}
 	return &Client{HTTPClient: httpClient, AccessToken: token, Endpoint: endpoint}
+}
+
+func (c *Client) ListEntriesPage(ctx context.Context, userID, page, perPage int) (ListPage, error) {
+	if userID < 1 {
+		return ListPage{}, fmt.Errorf("AniList user ID is required")
+	}
+	if page < 1 {
+		return ListPage{}, fmt.Errorf("AniList list page must be positive")
+	}
+	if perPage < 1 || perPage > 50 {
+		return ListPage{}, fmt.Errorf("AniList list page size must be between 1 and 50")
+	}
+	var response struct {
+		Data struct {
+			Page struct {
+				PageInfo struct {
+					HasNextPage bool `json:"hasNextPage"`
+				} `json:"pageInfo"`
+				MediaList []ListEntry `json:"mediaList"`
+			} `json:"Page"`
+		} `json:"data"`
+	}
+	query := `query ($userId: Int!, $page: Int!, $perPage: Int!) {
+		Page(page: $page, perPage: $perPage) {
+			pageInfo { hasNextPage }
+			mediaList(userId: $userId, type: ANIME, sort: MEDIA_ID) {
+				id mediaId status progress
+				media { id format episodes title { romaji english native } startDate { year } }
+			}
+		}
+	}`
+	if err := c.do(ctx, query, map[string]any{"userId": userID, "page": page, "perPage": perPage}, &response); err != nil {
+		return ListPage{}, err
+	}
+	return ListPage{Entries: response.Data.Page.MediaList, HasNextPage: response.Data.Page.PageInfo.HasNextPage}, nil
 }
 
 func (c *Client) AdvanceProgress(ctx context.Context, mediaID, progress int) error {

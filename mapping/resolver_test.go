@@ -69,3 +69,64 @@ func TestMovieDescriptor(t *testing.T) {
 		}
 	}
 }
+
+func TestReversePrefersCompleteTVDBSeriesAndMergesMatchingIDs(t *testing.T) {
+	dataset := Dataset{
+		"tvdb_show:100:s2": {"anilist:42": {"1-12": "1-12"}},
+		"tmdb_show:200:s2": {"anilist:42": {"1-12": "1-12"}},
+	}
+	sources, err := dataset.Reverse(42, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sources) != 2 {
+		t.Fatalf("sources = %#v", sources)
+	}
+	if sources[1].Season != 2 || sources[1].Episode != 2 ||
+		sources[1].ExternalIDs["tvdb"] != "100" || sources[1].ExternalIDs["tmdb"] != "200" {
+		t.Fatalf("second source = %#v", sources[1])
+	}
+}
+
+func TestReverseRatiosRepresentCompletedSourceEpisodes(t *testing.T) {
+	dataset := Dataset{
+		"tvdb_show:100:s1": {"anilist:42": {"1-4": "1-2|2"}},
+		"tvdb_show:200:s1": {"anilist:43": {"1-2": "1-6|-3"}},
+	}
+	manySources, err := dataset.Reverse(42, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(manySources) != 2 || manySources[1].Episode != 2 {
+		t.Fatalf("two-source projection = %#v", manySources)
+	}
+	manyTargets, err := dataset.Reverse(43, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(manyTargets) != 0 {
+		t.Fatalf("partial target group should not complete a source episode: %#v", manyTargets)
+	}
+	manyTargets, err = dataset.Reverse(43, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(manyTargets) != 1 || manyTargets[0].Episode != 1 {
+		t.Fatalf("completed target group = %#v", manyTargets)
+	}
+}
+
+func TestReversePrefersTMDBMovieIdentity(t *testing.T) {
+	dataset := Dataset{
+		"tvdb_movie:100": {"anilist:42": {}},
+		"tmdb_movie:200": {"anilist:42": {}},
+	}
+	sources, err := dataset.Reverse(42, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sources) != 1 || !sources[0].Movie ||
+		sources[0].ExternalIDs["tmdb"] != "200" || sources[0].ExternalIDs["tvdb"] != "100" {
+		t.Fatalf("sources = %#v", sources)
+	}
+}

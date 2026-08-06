@@ -1,6 +1,6 @@
 {
   "plugin_id": "dev.crowquillx.anilist-sync",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "checksum": "__CHECKSUM__",
   "silo_api_version": "v1",
   "supported_platforms": [
@@ -22,7 +22,7 @@
       "type": "watch_sync_provider.v1",
       "id": "anilist",
       "display_name": "AniList",
-      "description": "Synchronizes completed anime movies and episodes with AniList.",
+      "description": "Syncs completed playback and optionally manual watched marks to AniList, and imports mapped watch history.",
       "watch_sync_provider": {
         "auth_methods": [
           "WATCH_SYNC_AUTH_METHOD_AUTHORIZATION_CODE",
@@ -30,7 +30,7 @@
         ],
         "export_watched": true,
         "export_unwatched": false,
-        "import_watched": false,
+        "import_watched": true,
         "import_progress": false,
         "supported_media_types": [
           "WATCH_SYNC_MEDIA_TYPE_MOVIE",
@@ -42,7 +42,64 @@
           "tmdb",
           "tvdb"
         ],
+        "scrobble_playback": true,
         "max_batch_size": 25
+      }
+    }
+  ],
+  "global_config_schema": [
+    {
+      "key": "provider",
+      "title": "AniList provider settings",
+      "description": "OAuth credentials and watched synchronization behavior.",
+      "json_schema": "{\"type\":\"object\",\"additionalProperties\":false,\"properties\":{\"client_id\":{\"type\":\"string\",\"pattern\":\"^[0-9]+$\"},\"client_secret\":{\"type\":\"string\",\"minLength\":1},\"sync_manual_watched\":{\"type\":\"boolean\",\"default\":false},\"playback_completion_percent\":{\"type\":\"number\",\"minimum\":1,\"maximum\":99,\"default\":90}},\"required\":[\"client_id\",\"client_secret\"]}",
+      "required": true,
+      "admin_form": {
+        "fields": [
+          {
+            "key": "client_id",
+            "label": "Client ID",
+            "description": "Numeric AniList OAuth application ID.",
+            "control": "ADMIN_FORM_CONTROL_TEXT",
+            "required": true,
+            "validation": {
+              "pattern": "^[0-9]+$"
+            }
+          },
+          {
+            "key": "client_secret",
+            "label": "Client secret",
+            "description": "AniList OAuth application secret.",
+            "control": "ADMIN_FORM_CONTROL_PASSWORD",
+            "required": true,
+            "secret": true,
+            "validation": {
+              "min_length": 1
+            }
+          },
+          {
+            "key": "sync_manual_watched",
+            "label": "Sync manually marked watched items",
+            "description": "Also send items marked watched without being played. Completed playback always syncs.",
+            "control": "ADMIN_FORM_CONTROL_SWITCH",
+            "default_value": false
+          },
+          {
+            "key": "playback_completion_percent",
+            "label": "Playback completion threshold",
+            "description": "Playback must pass this percentage before AniList progress advances. Match Silo's watched threshold.",
+            "control": "ADMIN_FORM_CONTROL_NUMBER",
+            "required": true,
+            "default_value": 90,
+            "validation": {
+              "has_min": true,
+              "min": 1,
+              "has_max": true,
+              "max": 99
+            }
+          }
+        ],
+        "submit_label": "Save AniList settings"
       }
     }
   ],
@@ -50,8 +107,8 @@
   "presentation": {
     "display_name": "AniList Sync",
     "summary": "Reliably synchronize completed anime with AniList through Silo's watch-provider pipeline.",
-    "description_markdown": "Uses Silo's host-owned watch-sync pipeline for encrypted per-profile credentials, durable desired-state delivery, retries, and rich episode identity. Episode mappings prefer the daily AniBridge v3 dataset, with an Anime-Lists and ARM fallback. AniList progress is monotonic and ambiguous mappings are rejected rather than guessed.",
-    "setup_markdown": "Install the plugin, configure an AniList OAuth application in Silo's watch-provider administration page, then connect AniList from the desired profile. Silo stores credentials encrypted and invokes this plugin as a stateless provider adapter.",
+    "description_markdown": "Uses Silo's host-owned watch-sync pipeline for encrypted per-profile credentials, durable playback completion delivery, optional manual watched marks, retries, imports, and rich episode identity. Episode exports prefer the daily AniBridge v3 dataset, with an Anime-Lists and ARM fallback. Watch-history imports reverse-map AniList progress through AniBridge. AniList progress is monotonic and ambiguous mappings are rejected rather than guessed.",
+    "setup_markdown": "Install the plugin, enter an AniList OAuth application's client ID and secret, and match the playback completion threshold to Silo's watched threshold. Completed playback syncs automatically; enable the separate manual-watched switch only if items marked watched without playback should also sync. Silo stores provider and profile credentials encrypted and invokes this plugin as a stateless provider adapter.",
     "homepage_url": "https://github.com/crowquillx/silo-anilist-sync",
     "source_url": "https://github.com/crowquillx/silo-anilist-sync",
     "support_url": "https://github.com/crowquillx/silo-anilist-sync/issues",

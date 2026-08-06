@@ -105,3 +105,47 @@ func TestAdvanceProgressRejectsMappingPastKnownTotal(t *testing.T) {
 		t.Fatal("expected oversized mapped progress to fail")
 	}
 }
+
+func TestListEntriesPageReturnsStableMediaData(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Query     string         `json:"query"`
+			Variables map[string]any `json:"variables"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		if body.Variables["userId"] != float64(7) || body.Variables["page"] != float64(2) ||
+			body.Variables["perPage"] != float64(25) {
+			t.Fatalf("variables = %#v", body.Variables)
+		}
+		if body.Query == "" {
+			t.Fatal("query is empty")
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{"Page": map[string]any{
+			"pageInfo": map[string]any{"hasNextPage": true},
+			"mediaList": []map[string]any{{
+				"id": 9, "mediaId": 42, "status": "COMPLETED", "progress": 0,
+				"media": map[string]any{
+					"id": 42, "format": "TV", "episodes": 12,
+					"title":     map[string]any{"romaji": "Romaji", "english": "English"},
+					"startDate": map[string]any{"year": 2024},
+				},
+			}},
+		}}})
+	}))
+	defer server.Close()
+	client := NewClient("token", server.Client())
+	client.Endpoint = server.URL
+	page, err := client.ListEntriesPage(context.Background(), 7, 2, 25)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !page.HasNextPage || len(page.Entries) != 1 {
+		t.Fatalf("page = %#v", page)
+	}
+	entry := page.Entries[0]
+	if entry.MediaID != 42 || entry.Media.ID != 42 || entry.PreferredTitle() != "English" || entry.CompletedProgress() != 12 {
+		t.Fatalf("entry = %#v", entry)
+	}
+}
