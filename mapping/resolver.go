@@ -18,6 +18,19 @@ func (d Dataset) Resolve(provider, id string, season, episode int) ([]Target, er
 	if descriptor == "" {
 		return nil, nil
 	}
+	return d.resolveDescriptor(descriptor, episode)
+}
+
+func (d Dataset) resolveAniDB(id, scope string, episode int) ([]Target, error) {
+	id = strings.TrimSpace(id)
+	scope = strings.ToUpper(strings.TrimSpace(scope))
+	if id == "" || (scope != "R" && scope != "S") {
+		return nil, nil
+	}
+	return d.resolveDescriptor(fmt.Sprintf("anidb:%s:%s", id, scope), episode)
+}
+
+func (d Dataset) resolveDescriptor(descriptor string, episode int) ([]Target, error) {
 	targets := d[descriptor]
 	out := make([]Target, 0, len(targets))
 	for targetDescriptor, ranges := range targets {

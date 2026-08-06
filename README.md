@@ -24,7 +24,10 @@ The plugin remains a stateless provider adapter. It:
 1. Builds AniList authorization URLs and exchanges authorization codes.
 2. Validates credentials with AniList's `Viewer` query.
 3. Maps TVDB/TMDB/IMDb movie and episode identity through the daily
-   [AniBridge v3 mappings](https://github.com/anibridge/anibridge-mappings).
+   [AniBridge v3 mappings](https://github.com/anibridge/anibridge-mappings),
+   falling back through [Anime-Lists](https://github.com/Anime-Lists/anime-lists)
+   and the [ARM mapping service](https://github.com/BeeeQueue/arm-server) when
+   AniBridge has no direct mapping.
 4. Reads the existing AniList list entry and applies absolute, monotonic
    progress through `SaveMediaListEntry`.
 5. Returns typed applied, rejected, retry, rate-limit, and credential outcomes
@@ -38,11 +41,15 @@ persist or log them.
 - Resolve every available TVDB and TMDB descriptor and require convergence.
 - Use IMDb only as a movie fallback; AniBridge has no populated IMDb-series
   mappings.
+- Prefer direct AniBridge mappings. Use Anime-Lists only to resolve an external
+  identity and episode to AniDB. Prefer AniBridge's AniDB episode projection
+  when available, then use ARM as the independent AniDB-to-AniList fallback for
+  regular episodes and movies.
 - Support AniBridge v3 ratio semantics.
 - Reject conflicting mappings, non-contiguous target ranges, and mapped
   progress beyond AniList's known episode count.
 - Never guess by title.
-- Retain the last valid in-memory dataset if a daily refresh fails.
+- Retain the last valid in-memory datasets if a daily refresh fails.
 
 ## AniList progress policy
 
@@ -75,16 +82,18 @@ nix shell nixpkgs#go --command fish -c 'CGO_ENABLED=0 go test ./...'
 ## Privacy and upstream services
 
 The plugin sends AniList media IDs and absolute progress to AniList and
-retrieves the public AniBridge mapping artifact from GitHub Releases. Silo
-passes decrypted credentials only over the local plugin gRPC channel for calls
-that need them.
+retrieves the public AniBridge mapping artifact from GitHub Releases and the
+public Anime-Lists XML from GitHub. Fallback resolution sends AniDB IDs to the
+public ARM mapping service; no AniList credentials or Silo user information are
+sent to mapping services. Silo passes decrypted credentials only over the local
+plugin gRPC channel for calls that need them.
 
 ## Attribution
 
-Cross-provider mappings are supplied by
-[anibridge/anibridge-mappings](https://github.com/anibridge/anibridge-mappings),
-distributed under the MIT License and assembled from upstream sources
-identified by that project.
+Many thanks to [AniBridge](https://github.com/anibridge/anibridge-mappings),
+[Anime-Lists](https://github.com/Anime-Lists/anime-lists), and
+[ARM](https://github.com/BeeeQueue/arm-server) for making reliable
+cross-provider anime mapping possible.
 
 ## License
 

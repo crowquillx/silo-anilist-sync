@@ -50,7 +50,7 @@
   "presentation": {
     "display_name": "AniList Sync",
     "summary": "Reliably synchronize completed anime with AniList through Silo's watch-provider pipeline.",
-    "description_markdown": "Uses Silo's host-owned watch-sync pipeline for encrypted per-profile credentials, durable desired-state delivery, retries, and rich episode identity. Episode mappings come from the daily AniBridge v3 dataset. AniList progress is monotonic and ambiguous mappings are rejected rather than guessed.",
+    "description_markdown": "Uses Silo's host-owned watch-sync pipeline for encrypted per-profile credentials, durable desired-state delivery, retries, and rich episode identity. Episode mappings prefer the daily AniBridge v3 dataset, with an Anime-Lists and ARM fallback. AniList progress is monotonic and ambiguous mappings are rejected rather than guessed.",
     "setup_markdown": "Install the plugin, configure an AniList OAuth application in Silo's watch-provider administration page, then connect AniList from the desired profile. Silo stores credentials encrypted and invokes this plugin as a stateless provider adapter.",
     "homepage_url": "https://github.com/crowquillx/silo-anilist-sync",
     "source_url": "https://github.com/crowquillx/silo-anilist-sync",

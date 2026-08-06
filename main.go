@@ -103,7 +103,7 @@ func (s *server) ApplyEvents(ctx context.Context, req *pluginv1.WatchSyncApplyEv
 	return &pluginv1.WatchSyncApplyEventsResponse{Results: results}, nil
 }
 
-func applyEvent(ctx context.Context, client *anilist.Client, dataset mapping.Dataset, event *pluginv1.WatchSyncEvent) *pluginv1.WatchSyncApplyResult {
+func applyEvent(ctx context.Context, client *anilist.Client, dataset mapping.Catalog, event *pluginv1.WatchSyncEvent) *pluginv1.WatchSyncApplyResult {
 	result := &pluginv1.WatchSyncApplyResult{EventId: event.GetEventId()}
 	if event.GetOperation() != pluginv1.WatchSyncOperation_WATCH_SYNC_OPERATION_MARK_WATCHED {
 		result.Status = pluginv1.WatchSyncApplyStatus_WATCH_SYNC_APPLY_STATUS_REJECTED
@@ -113,8 +113,12 @@ func applyEvent(ctx context.Context, client *anilist.Client, dataset mapping.Dat
 		}
 		return result
 	}
-	targets, err := resolveTargets(dataset, event.GetMedia())
+	targets, err := resolveTargets(ctx, dataset, event.GetMedia())
 	if err != nil {
+		var mappingErr *mapping.TemporaryError
+		if errors.As(err, &mappingErr) {
+			return applyErrorResult(event.GetEventId(), err)
+		}
 		result.Status = pluginv1.WatchSyncApplyStatus_WATCH_SYNC_APPLY_STATUS_REJECTED
 		result.Fault = &pluginv1.WatchSyncFault{
 			Code:        pluginv1.WatchSyncFaultCode_WATCH_SYNC_FAULT_CODE_INVALID_REQUEST,
@@ -126,7 +130,7 @@ func applyEvent(ctx context.Context, client *anilist.Client, dataset mapping.Dat
 		result.Status = pluginv1.WatchSyncApplyStatus_WATCH_SYNC_APPLY_STATUS_REJECTED
 		result.Fault = &pluginv1.WatchSyncFault{
 			Code:        pluginv1.WatchSyncFaultCode_WATCH_SYNC_FAULT_CODE_PERMANENT,
-			SafeMessage: "no unambiguous AniBridge mapping was found",
+			SafeMessage: "no unambiguous AniBridge, Anime-Lists, or ARM mapping was found",
 		}
 		return result
 	}
@@ -144,7 +148,7 @@ func applyEvent(ctx context.Context, client *anilist.Client, dataset mapping.Dat
 	return result
 }
 
-func resolveTargets(dataset mapping.Dataset, media *pluginv1.WatchSyncMedia) (map[int]int, error) {
+func resolveTargets(ctx context.Context, dataset mapping.Catalog, media *pluginv1.WatchSyncMedia) (map[int]int, error) {
 	if media == nil {
 		return nil, errors.New("watch event has no media identity")
 	}
@@ -161,17 +165,17 @@ func resolveTargets(dataset mapping.Dataset, media *pluginv1.WatchSyncMedia) (ma
 	default:
 		return nil, fmt.Errorf("unsupported watch media type %q", media.GetMediaType())
 	}
-	return convergedMappings(dataset, ids, season, episode)
+	return convergedMappings(ctx, dataset, ids, season, episode)
 }
 
-func convergedMappings(dataset mapping.Dataset, ids map[string]string, season, episode int) (map[int]int, error) {
+func convergedMappings(ctx context.Context, dataset mapping.Catalog, ids map[string]string, season, episode int) (map[int]int, error) {
 	var resolved map[int]int
 	for _, provider := range []string{"tvdb", "tmdb"} {
 		providerID := strings.TrimSpace(ids[provider])
 		if providerID == "" {
 			continue
 		}
-		targets, err := dataset.Resolve(provider, providerID, season, episode)
+		targets, err := dataset.Resolve(ctx, provider, providerID, season, episode)
 		if err != nil {
 			return nil, err
 		}
@@ -180,12 +184,12 @@ func convergedMappings(dataset mapping.Dataset, ids map[string]string, season, e
 		}
 		candidate := targetsMap(targets)
 		if resolved != nil && !sameTargets(resolved, candidate) {
-			return nil, fmt.Errorf("AniBridge mappings disagree between provider IDs")
+			return nil, fmt.Errorf("anime mappings disagree between provider IDs")
 		}
 		resolved = candidate
 	}
 	if resolved == nil && season < 0 && strings.TrimSpace(ids["imdb"]) != "" {
-		targets, err := dataset.Resolve("imdb", ids["imdb"], season, episode)
+		targets, err := dataset.Resolve(ctx, "imdb", ids["imdb"], season, episode)
 		if err != nil {
 			return nil, err
 		}
@@ -264,6 +268,11 @@ func invalidRequestFault(err error) *pluginv1.WatchSyncFault {
 
 func faultFromError(err error) *pluginv1.WatchSyncFault {
 	fault := &pluginv1.WatchSyncFault{Code: pluginv1.WatchSyncFaultCode_WATCH_SYNC_FAULT_CODE_TEMPORARY, SafeMessage: "temporary AniList request failure"}
+	var mappingErr *mapping.TemporaryError
+	if errors.As(err, &mappingErr) {
+		fault.SafeMessage = "temporary anime mapping service failure"
+		return fault
+	}
 	var apiErr *anilist.Error
 	if !errors.As(err, &apiErr) {
 		return fault
