@@ -111,3 +111,27 @@ func TestInvalidConfig(t *testing.T) {
 }
 
 func kindPtr(k Kind) *Kind { return &k }
+
+func TestValidateProfileTellsUnknownProfileFromWrongURL(t *testing.T) {
+	for _, tc := range []struct {
+		name, body string
+		kind       Kind
+		message    string
+	}{
+		{"unknown profile", `{"error":"not_found","message":"Profile not found"}`, InvalidConfig, "Silo profile ID was not found"},
+		{"not Silo", `404 page not found`, Permanent, "check the server URL"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(http.StatusNotFound)
+				_, _ = w.Write([]byte(tc.body))
+			}))
+			defer upstream.Close()
+			err := NewClient(Config{BaseURL: upstream.URL, APIKey: "api-secret", ProfileID: "p"}).ValidateProfile(context.Background())
+			var siloErr *Error
+			if !errors.As(err, &siloErr) || siloErr.Kind != tc.kind || !strings.Contains(siloErr.Error(), tc.message) {
+				t.Fatalf("error = %#v", err)
+			}
+		})
+	}
+}

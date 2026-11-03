@@ -40,10 +40,47 @@ func (d Dataset) Reverse(anilistID, progress int) []MediaSource {
 	if anilistID < 1 || progress < 1 {
 		return nil
 	}
+	descriptors := make([]string, 0)
+	targetDescriptor := "anilist:" + strconv.Itoa(anilistID)
+	for descriptor, targets := range d {
+		if _, ok := targets[targetDescriptor]; ok {
+			descriptors = append(descriptors, descriptor)
+		}
+	}
+	return d.reverseFrom(descriptors, anilistID, progress)
+}
+
+// ReverseIndex lists, for each AniList descriptor, the source descriptors
+// that map to it. Building it once per dataset turns each reverse lookup into
+// a few map reads instead of a scan of the whole dataset.
+type ReverseIndex map[string][]string
+
+// BuildReverseIndex indexes every AniList target in the dataset.
+func (d Dataset) BuildReverseIndex() ReverseIndex {
+	index := make(ReverseIndex)
+	for descriptor, targets := range d {
+		for target := range targets {
+			if strings.HasPrefix(target, "anilist:") {
+				index[target] = append(index[target], descriptor)
+			}
+		}
+	}
+	return index
+}
+
+// ReverseIndexed is Reverse using a prebuilt index of this dataset.
+func (d Dataset) ReverseIndexed(index ReverseIndex, anilistID, progress int) []MediaSource {
+	if anilistID < 1 || progress < 1 {
+		return nil
+	}
+	return d.reverseFrom(index["anilist:"+strconv.Itoa(anilistID)], anilistID, progress)
+}
+
+func (d Dataset) reverseFrom(descriptors []string, anilistID, progress int) []MediaSource {
 	targetDescriptor := "anilist:" + strconv.Itoa(anilistID)
 	var candidates []sourceCandidate
-	for descriptor, targets := range d {
-		ranges, ok := targets[targetDescriptor]
+	for _, descriptor := range descriptors {
+		ranges, ok := d[descriptor][targetDescriptor]
 		if !ok {
 			continue
 		}
@@ -306,6 +343,11 @@ func sourceDescriptor(provider, id string, season int) string {
 	}
 }
 
+// mapEpisode projects a source episode through a descriptor's ranges. Rows
+// are tried in order of their start episode, so the result never depends on
+// map iteration order. A source range that cannot be parsed is skipped: the
+// dataset is a daily third-party artifact, and one bad row must not break
+// the episodes its other rows cover.
 func mapEpisode(ranges map[string]string, episode int) (int, bool, error) {
 	if episode < 1 {
 		return 0, false, nil
@@ -313,15 +355,29 @@ func mapEpisode(ranges map[string]string, episode int) (int, bool, error) {
 	if len(ranges) == 0 {
 		return episode, true, nil
 	}
+	type row struct {
+		start, end int
+		target     string
+	}
+	rows := make([]row, 0, len(ranges))
 	for source, target := range ranges {
 		start, end, err := parseRange(source)
 		if err != nil {
-			return 0, false, err
-		}
-		if episode < start || (end > 0 && episode > end) {
 			continue
 		}
-		return projectEpisode(target, episode-start)
+		rows = append(rows, row{start, end, target})
+	}
+	sort.Slice(rows, func(i, j int) bool {
+		if rows[i].start != rows[j].start {
+			return rows[i].start < rows[j].start
+		}
+		return rows[i].target < rows[j].target
+	})
+	for _, r := range rows {
+		if episode < r.start || (r.end > 0 && episode > r.end) {
+			continue
+		}
+		return projectEpisode(r.target, episode-r.start)
 	}
 	return 0, false, nil
 }

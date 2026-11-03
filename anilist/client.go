@@ -6,9 +6,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -37,7 +39,19 @@ type Error struct {
 	Status     int
 	Message    string
 	RetryAfter time.Duration
+	// InvalidToken is set when AniList rejected the access token. AniList
+	// answers a revoked or expired token with HTTP 400 "Invalid token", not
+	// 401, so the status alone does not identify a credential failure.
+	InvalidToken bool
 }
+
+// MismatchError reports a mapping that contradicts AniList's own data, such
+// as progress past the episode count. Retrying cannot fix it.
+type MismatchError struct {
+	Message string
+}
+
+func (e *MismatchError) Error() string { return e.Message }
 
 func (e *Error) Error() string {
 	if e.Message != "" {
@@ -50,19 +64,25 @@ type graphQLError struct {
 	Message string `json:"message"`
 }
 
+type mediaListEntry struct {
+	ID       int     `json:"id"`
+	Progress int     `json:"progress"`
+	Status   string  `json:"status"`
+	Repeat   int     `json:"repeat"`
+	Score    float64 `json:"score"`
+}
+
 type mediaResponse struct {
 	Data struct {
 		Media struct {
-			Episodes       *int `json:"episodes"`
-			MediaListEntry *struct {
-				ID       int    `json:"id"`
-				Progress int    `json:"progress"`
-				Status   string `json:"status"`
-			} `json:"mediaListEntry"`
+			Episodes       *int            `json:"episodes"`
+			MediaListEntry *mediaListEntry `json:"mediaListEntry"`
 		} `json:"Media"`
 	} `json:"data"`
 	Errors []graphQLError `json:"errors"`
 }
+
+const mediaQuery = `query ($id: Int!) { Media(id: $id, type: ANIME) { episodes mediaListEntry { id progress status repeat score(format: POINT_100) } } }`
 
 type ListEntry struct {
 	ID        int
@@ -70,7 +90,9 @@ type ListEntry struct {
 	Status    string
 	Progress  int
 	UpdatedAt int
-	Media     struct {
+	// Score is the entry's score on AniList's 100-point scale; 0 is unscored.
+	Score float64
+	Media struct {
 		ID       int
 		Format   string
 		Episodes *int
@@ -118,6 +140,43 @@ type rateLimiter struct {
 	mu       sync.Mutex
 	next     time.Time
 	interval time.Duration
+
+	limit         int
+	throttledAt   time.Time
+	throttleCount int
+}
+
+// RateStatus describes the shared AniList request pacing.
+type RateStatus struct {
+	// Limit is AniList's advertised requests per minute, 0 until seen.
+	Limit int
+	// Interval is the current spacing between requests.
+	Interval time.Duration
+	// ThrottledAt is the last time AniList answered 429.
+	ThrottledAt time.Time
+	// Throttled counts 429 answers since the plugin started.
+	Throttled int
+}
+
+// SharedRateStatus reports the pacing shared by every default client.
+func SharedRateStatus() RateStatus {
+	l := sharedRateLimiter
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return RateStatus{Limit: l.limit, Interval: l.interval, ThrottledAt: l.throttledAt, Throttled: l.throttleCount}
+}
+
+// EstimatedDelay is how long the given number of requests would take to
+// start on the shared limiter from now.
+func EstimatedDelay(requests int) time.Duration {
+	if requests < 1 {
+		return 0
+	}
+	l := sharedRateLimiter
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	wait := max(0, time.Until(l.next))
+	return wait + time.Duration(requests-1)*l.interval
 }
 
 func newRateLimiter(requestsPerMinute int) *rateLimiter {
@@ -184,6 +243,13 @@ func (l *rateLimiter) observe(header http.Header, status int) time.Duration {
 
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	if limit, ok := nonNegativeHeaderInt(header, "X-RateLimit-Limit"); ok && limit > 0 {
+		l.limit = limit
+	}
+	if status == http.StatusTooManyRequests {
+		l.throttledAt = now
+		l.throttleCount++
+	}
 	if interval > 0 {
 		l.interval = interval
 	} else if status == http.StatusTooManyRequests && l.interval <= 0 {
@@ -257,7 +323,7 @@ func (c *Client) ListEntries(ctx context.Context, userID int) ([]ListEntry, erro
 			} `json:"MediaListCollection"`
 		} `json:"data"`
 	}
-	query := `query ($userId: Int!) { MediaListCollection(userId: $userId, type: ANIME) { lists { entries { id mediaId status progress updatedAt media { id format episodes title { romaji english native } startDate { year } } } } } }`
+	query := `query ($userId: Int!) { MediaListCollection(userId: $userId, type: ANIME) { lists { entries { id mediaId status progress updatedAt score(format: POINT_100) media { id format episodes title { romaji english native } startDate { year } } } } } }`
 	httpClient := *c.HTTPClient
 	// Very large lists can legitimately exceed the default 15s request
 	// budget; give the full-list import its own longer deadline while
@@ -302,14 +368,13 @@ func (c *Client) AdvanceProgressIfExisting(ctx context.Context, mediaID, progres
 
 func (c *Client) advanceProgress(ctx context.Context, mediaID, progress int, onlyExisting bool) (bool, error) {
 	if c.AccessToken == "" {
-		return false, fmt.Errorf("AniList access token is not configured")
+		return false, errNoToken()
 	}
 	if progress < 1 {
 		return false, nil
 	}
 	var current mediaResponse
-	query := `query ($id: Int!) { Media(id: $id, type: ANIME) { episodes mediaListEntry { id progress status } } }`
-	if err := c.do(ctx, query, map[string]any{"id": mediaID}, &current); err != nil {
+	if err := c.do(ctx, mediaQuery, map[string]any{"id": mediaID}, &current); err != nil {
 		return false, err
 	}
 	entry := current.Data.Media.MediaListEntry
@@ -318,11 +383,12 @@ func (c *Client) advanceProgress(ctx context.Context, mediaID, progress int, onl
 	}
 	episodes := current.Data.Media.Episodes
 	if episodes != nil && *episodes > 0 && progress > *episodes {
-		return false, fmt.Errorf("mapped progress %d exceeds AniList episode count %d", progress, *episodes)
+		return false, &MismatchError{Message: fmt.Sprintf("mapped progress %d exceeds AniList episode count %d", progress, *episodes)}
 	}
+	final := episodes != nil && progress == *episodes
 	if entry == nil {
 		status := "CURRENT"
-		if episodes != nil && progress == *episodes {
+		if final {
 			status = "COMPLETED"
 		}
 		mutation := `mutation ($mediaId: Int!, $progress: Int!, $status: MediaListStatus!) { SaveMediaListEntry(mediaId: $mediaId, progress: $progress, status: $status) { id } }`
@@ -334,27 +400,134 @@ func (c *Client) advanceProgress(ctx context.Context, mediaID, progress int, onl
 	if entry.Status == "COMPLETED" || entry.Progress >= progress {
 		return false, nil
 	}
-	status := entry.Status
-	switch entry.Status {
-	case "PLANNING":
-		status = "CURRENT"
-	case "CURRENT":
-		if episodes != nil && progress == *episodes {
-			status = "COMPLETED"
+	variables := map[string]any{"id": entry.ID, "progress": progress}
+	status := nextStatus(entry.Status, final)
+	if status != entry.Status {
+		variables["status"] = status
+	}
+	// Finishing a rewatch completes the entry and counts the rewatch, the
+	// way AniList's own list editor does.
+	if entry.Status == "REPEATING" && final {
+		variables["repeat"] = entry.Repeat + 1
+	}
+	if err := c.saveEntry(ctx, variables); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// nextStatus is the list status after watching more of an entry. Watching a
+// planned, paused or dropped anime resumes it, and the final episode
+// completes it.
+func nextStatus(status string, final bool) string {
+	switch status {
+	case "PLANNING", "PAUSED", "DROPPED", "CURRENT":
+		if final {
+			return "COMPLETED"
+		}
+		return "CURRENT"
+	case "REPEATING":
+		if final {
+			return "COMPLETED"
 		}
 	}
-	if status == entry.Status {
-		mutation := `mutation ($id: Int!, $progress: Int!) { SaveMediaListEntry(id: $id, progress: $progress) { id } }`
-		if err := c.do(ctx, mutation, map[string]any{"id": entry.ID, "progress": progress}, &struct{}{}); err != nil {
+	return status
+}
+
+// saveEntry updates an existing list entry with the given fields. Only
+// fields present in variables change.
+func (c *Client) saveEntry(ctx context.Context, variables map[string]any) error {
+	params := []string{"$id: Int!"}
+	args := []string{"id: $id"}
+	for _, field := range []struct{ name, kind string }{
+		{"progress", "Int"}, {"status", "MediaListStatus"}, {"repeat", "Int"}, {"scoreRaw", "Int"},
+	} {
+		if _, ok := variables[field.name]; ok {
+			params = append(params, "$"+field.name+": "+field.kind+"!")
+			args = append(args, field.name+": $"+field.name)
+		}
+	}
+	mutation := "mutation (" + strings.Join(params, ", ") + ") { SaveMediaListEntry(" + strings.Join(args, ", ") + ") { id } }"
+	return c.do(ctx, mutation, variables, &struct{}{})
+}
+
+// SetScore sets an anime's score from a 1 to 10 rating. Without a list
+// entry it adds the anime as completed, because Silo sends a new rating only
+// after the title was watched. It reports whether AniList changed.
+func (c *Client) SetScore(ctx context.Context, mediaID, rating int, onlyExisting bool) (bool, error) {
+	if c.AccessToken == "" {
+		return false, errNoToken()
+	}
+	if rating < 1 || rating > 10 {
+		return false, &MismatchError{Message: fmt.Sprintf("rating %d is outside 1 to 10", rating)}
+	}
+	var current mediaResponse
+	if err := c.do(ctx, mediaQuery, map[string]any{"id": mediaID}, &current); err != nil {
+		return false, err
+	}
+	scoreRaw := rating * 10
+	entry := current.Data.Media.MediaListEntry
+	if entry == nil {
+		if onlyExisting {
+			return false, nil
+		}
+		variables := map[string]any{"mediaId": mediaID, "status": "COMPLETED", "scoreRaw": scoreRaw}
+		params, args := "$mediaId: Int!, $status: MediaListStatus!, $scoreRaw: Int!", "mediaId: $mediaId, status: $status, scoreRaw: $scoreRaw"
+		if episodes := current.Data.Media.Episodes; episodes != nil && *episodes > 0 {
+			variables["progress"] = *episodes
+			params += ", $progress: Int!"
+			args += ", progress: $progress"
+		}
+		mutation := "mutation (" + params + ") { SaveMediaListEntry(" + args + ") { id } }"
+		if err := c.do(ctx, mutation, variables, &struct{}{}); err != nil {
 			return false, err
 		}
 		return true, nil
 	}
-	mutation := `mutation ($id: Int!, $progress: Int!, $status: MediaListStatus!) { SaveMediaListEntry(id: $id, progress: $progress, status: $status) { id } }`
-	if err := c.do(ctx, mutation, map[string]any{"id": entry.ID, "progress": progress, "status": status}, &struct{}{}); err != nil {
+	if RatingFromScore(entry.Score) == rating {
+		return false, nil
+	}
+	if err := c.saveEntry(ctx, map[string]any{"id": entry.ID, "scoreRaw": scoreRaw}); err != nil {
 		return false, err
 	}
 	return true, nil
+}
+
+// RemoveScore clears an anime's score. It reports whether AniList changed.
+func (c *Client) RemoveScore(ctx context.Context, mediaID int) (bool, error) {
+	if c.AccessToken == "" {
+		return false, errNoToken()
+	}
+	var current mediaResponse
+	if err := c.do(ctx, mediaQuery, map[string]any{"id": mediaID}, &current); err != nil {
+		return false, err
+	}
+	entry := current.Data.Media.MediaListEntry
+	if entry == nil || entry.Score <= 0 {
+		return false, nil
+	}
+	if err := c.saveEntry(ctx, map[string]any{"id": entry.ID, "scoreRaw": 0}); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// RatingFromScore converts a 100-point AniList score to Silo's 1 to 10
+// rating, rounding half up. An unscored entry is 0.
+func RatingFromScore(score float64) int {
+	if score <= 0 {
+		return 0
+	}
+	rating := int(math.Floor(score/10 + 0.5))
+	return min(10, max(1, rating))
+}
+
+func errNoToken() error {
+	return &Error{Status: http.StatusUnauthorized, Message: "AniList access token is not configured", InvalidToken: true}
+}
+
+func isInvalidToken(message string) bool {
+	return strings.EqualFold(strings.TrimSpace(message), "invalid token")
 }
 
 func (c *Client) do(ctx context.Context, query string, variables map[string]any, out any) error {
@@ -382,7 +555,19 @@ func (c *Client) doWithLimit(ctx context.Context, httpClient *http.Client, query
 	defer resp.Body.Close()
 	retryAfter := c.limiter.observe(resp.Header, resp.StatusCode)
 	if resp.StatusCode != http.StatusOK {
-		return &Error{Status: resp.StatusCode, RetryAfter: retryAfter}
+		// AniList explains most failures in a GraphQL error body, whatever
+		// the status. Keep its message so faults can say what went wrong.
+		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+		apiErr := &Error{Status: resp.StatusCode, RetryAfter: retryAfter}
+		var envelope struct {
+			Errors []graphQLError `json:"errors"`
+		}
+		if json.Unmarshal(raw, &envelope) == nil && len(envelope.Errors) > 0 {
+			apiErr.Message = "AniList GraphQL: " + envelope.Errors[0].Message
+			apiErr.InvalidToken = isInvalidToken(envelope.Errors[0].Message)
+		}
+		apiErr.InvalidToken = apiErr.InvalidToken || resp.StatusCode == http.StatusUnauthorized
+		return apiErr
 	}
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxBytes))
 	if err != nil {
@@ -395,7 +580,7 @@ func (c *Client) doWithLimit(ctx context.Context, httpClient *http.Client, query
 		return fmt.Errorf("decode AniList response: %w", err)
 	}
 	if len(envelope.Errors) > 0 {
-		return &Error{Status: resp.StatusCode, Message: "AniList GraphQL: " + envelope.Errors[0].Message}
+		return &Error{Status: resp.StatusCode, Message: "AniList GraphQL: " + envelope.Errors[0].Message, InvalidToken: isInvalidToken(envelope.Errors[0].Message)}
 	}
 	if err := json.Unmarshal(raw, out); err != nil {
 		return fmt.Errorf("decode AniList response data: %w", err)

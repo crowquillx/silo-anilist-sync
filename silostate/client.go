@@ -82,12 +82,19 @@ func (c *Client) validateProfile(ctx context.Context) error {
 		Profiles []struct {
 			ID string `json:"id"`
 		} `json:"profiles"`
+		Error   string `json:"error"`
+		Message string `json:"message"`
 	}
 	status, err := c.get(ctx, "/api/v1/profiles", &response)
 	if err != nil {
 		return err
 	}
 	if status == http.StatusNotFound {
+		// Silo answers an unknown X-Profile-Id with its own not_found error;
+		// any other 404 means the URL does not lead to Silo's API.
+		if response.Error == "not_found" && strings.Contains(strings.ToLower(response.Message), "profile") {
+			return &Error{InvalidConfig, "Silo profile ID was not found for this API key's account; check the profile ID"}
+		}
 		return &Error{Permanent, "Silo profile verification endpoint was not found; check the server URL"}
 	}
 	for _, profile := range response.Profiles {
@@ -147,6 +154,10 @@ func (c *Client) get(ctx context.Context, path string, target any) (int, error) 
 	switch response.StatusCode {
 	case http.StatusOK:
 	case http.StatusNotFound:
+		// A 404 body is read only to tell Silo's own errors apart. It is
+		// never shown, so an unreadable one is not an error.
+		body, _ := io.ReadAll(io.LimitReader(response.Body, 64<<10))
+		_ = json.Unmarshal(body, target)
 		return response.StatusCode, nil
 	case http.StatusUnauthorized:
 		return response.StatusCode, &Error{InvalidCredential, "Silo verification API key was rejected; reconnect with a valid key"}

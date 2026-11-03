@@ -3,6 +3,7 @@ package anilist
 import (
 	"context"
 	"encoding/json"
+	"errors"
 
 	"net/http"
 	"net/http/httptest"
@@ -177,7 +178,10 @@ func TestAdvanceProgressIfExistingUsesAuthenticatedAccount(t *testing.T) {
 	}
 }
 
-func TestAdvanceProgressPreservesPausedStatusAndUsesEntryID(t *testing.T) {
+// entryServer answers the Media query with entry and records the variables
+// of the mutation that follows it.
+func entryServer(t *testing.T, episodes any, entry map[string]any, mutation *map[string]any) *Client {
+	t.Helper()
 	calls := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls++
@@ -186,24 +190,175 @@ func TestAdvanceProgressPreservesPausedStatusAndUsesEntryID(t *testing.T) {
 		}
 		_ = json.NewDecoder(r.Body).Decode(&body)
 		if calls == 1 {
+			var listEntry any
+			if entry != nil {
+				listEntry = entry
+			}
 			_ = json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{"Media": map[string]any{
-				"episodes": 12, "mediaListEntry": map[string]any{"id": 77, "progress": 3, "status": "PAUSED"},
+				"episodes": episodes, "mediaListEntry": listEntry,
 			}}})
 			return
 		}
-		if body.Variables["id"] != float64(77) || body.Variables["progress"] != float64(4) {
-			t.Fatalf("mutation variables = %#v", body.Variables)
+		if mutation == nil {
+			t.Fatalf("unexpected mutation %#v", body.Variables)
 		}
-		if _, ok := body.Variables["status"]; ok {
-			t.Fatalf("paused status should be preserved: %#v", body.Variables)
-		}
-		_ = json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{"SaveMediaListEntry": map[string]any{"id": 77}}})
+		*mutation = body.Variables
+		_ = json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{"SaveMediaListEntry": map[string]any{"id": 1}}})
+	}))
+	t.Cleanup(server.Close)
+	client := NewClient("token", server.Client())
+	client.Endpoint = server.URL
+	return client
+}
+
+func TestAdvanceProgressStatusTransitions(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		entry      map[string]any
+		progress   int
+		wantStatus any
+		wantRepeat any
+	}{
+		{"paused resumes", map[string]any{"id": 77, "progress": 3, "status": "PAUSED"}, 4, "CURRENT", nil},
+		{"dropped resumes", map[string]any{"id": 77, "progress": 3, "status": "DROPPED"}, 4, "CURRENT", nil},
+		{"planning starts", map[string]any{"id": 77, "progress": 0, "status": "PLANNING"}, 1, "CURRENT", nil},
+		{"planning final completes", map[string]any{"id": 77, "progress": 0, "status": "PLANNING"}, 12, "COMPLETED", nil},
+		{"current keeps status", map[string]any{"id": 77, "progress": 3, "status": "CURRENT"}, 4, nil, nil},
+		{"current final completes", map[string]any{"id": 77, "progress": 11, "status": "CURRENT"}, 12, "COMPLETED", nil},
+		{"rewatch keeps status", map[string]any{"id": 77, "progress": 2, "status": "REPEATING", "repeat": 1}, 3, nil, nil},
+		{"rewatch final completes and counts", map[string]any{"id": 77, "progress": 11, "status": "REPEATING", "repeat": 1}, 12, "COMPLETED", float64(2)},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var mutation map[string]any
+			client := entryServer(t, 12, test.entry, &mutation)
+			if err := client.AdvanceProgress(context.Background(), 1, test.progress); err != nil {
+				t.Fatal(err)
+			}
+			if mutation["id"] != float64(77) || mutation["progress"] != float64(test.progress) {
+				t.Fatalf("mutation variables = %#v", mutation)
+			}
+			if mutation["status"] != test.wantStatus || mutation["repeat"] != test.wantRepeat {
+				t.Fatalf("status = %#v, repeat = %#v; want %#v, %#v", mutation["status"], mutation["repeat"], test.wantStatus, test.wantRepeat)
+			}
+		})
+	}
+}
+
+func TestAdvanceProgressLeavesCompletedEntry(t *testing.T) {
+	client := entryServer(t, 12, map[string]any{"id": 77, "progress": 12, "status": "COMPLETED"}, nil)
+	if err := client.AdvanceProgress(context.Background(), 1, 3); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestMappingPastKnownTotalIsAMismatch(t *testing.T) {
+	client := entryServer(t, 12, nil, nil)
+	err := client.AdvanceProgress(context.Background(), 1, 13)
+	var mismatch *MismatchError
+	if !errors.As(err, &mismatch) {
+		t.Fatalf("error = %#v, want MismatchError", err)
+	}
+}
+
+func TestInvalidTokenIsRecognizedFromErrorBody(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		// AniList's real answer to a revoked or expired token.
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"data":null,"errors":[{"message":"Invalid token","status":400}]}`))
 	}))
 	defer server.Close()
 	client := NewClient("token", server.Client())
 	client.Endpoint = server.URL
-	if err := client.AdvanceProgress(context.Background(), 1, 4); err != nil {
-		t.Fatal(err)
+	_, err := client.Viewer(context.Background())
+	var apiErr *Error
+	if !errors.As(err, &apiErr) || !apiErr.InvalidToken || apiErr.Status != 400 || apiErr.Message != "AniList GraphQL: Invalid token" {
+		t.Fatalf("error = %#v", err)
+	}
+}
+
+func TestErrorBodyMessageIsKeptForOtherStatuses(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte(`{"data":{"Media":null},"errors":[{"message":"Not Found.","status":404}]}`))
+	}))
+	defer server.Close()
+	client := NewClient("token", server.Client())
+	client.Endpoint = server.URL
+	err := client.AdvanceProgress(context.Background(), 1, 1)
+	var apiErr *Error
+	if !errors.As(err, &apiErr) || apiErr.InvalidToken || apiErr.Message != "AniList GraphQL: Not Found." {
+		t.Fatalf("error = %#v", err)
+	}
+}
+
+func TestMissingTokenIsAnInvalidCredential(t *testing.T) {
+	_, err := NewClient("", nil).SetScore(context.Background(), 1, 5, false)
+	var apiErr *Error
+	if !errors.As(err, &apiErr) || !apiErr.InvalidToken {
+		t.Fatalf("error = %#v", err)
+	}
+}
+
+func TestSetScoreUpdatesExistingEntry(t *testing.T) {
+	var mutation map[string]any
+	client := entryServer(t, 1, map[string]any{"id": 9, "progress": 1, "status": "COMPLETED", "score": 60}, &mutation)
+	applied, err := client.SetScore(context.Background(), 1, 8, false)
+	if err != nil || !applied {
+		t.Fatalf("applied = %v, err = %v", applied, err)
+	}
+	if mutation["id"] != float64(9) || mutation["scoreRaw"] != float64(80) || len(mutation) != 2 {
+		t.Fatalf("mutation variables = %#v", mutation)
+	}
+}
+
+func TestSetScoreSameRatingIsNoChange(t *testing.T) {
+	client := entryServer(t, 1, map[string]any{"id": 9, "progress": 1, "status": "COMPLETED", "score": 75}, nil)
+	applied, err := client.SetScore(context.Background(), 1, 8, false)
+	if err != nil || applied {
+		t.Fatalf("applied = %v, err = %v", applied, err)
+	}
+}
+
+func TestSetScoreAddsWatchedEntry(t *testing.T) {
+	var mutation map[string]any
+	client := entryServer(t, 1, nil, &mutation)
+	applied, err := client.SetScore(context.Background(), 5, 7, false)
+	if err != nil || !applied {
+		t.Fatalf("applied = %v, err = %v", applied, err)
+	}
+	if mutation["mediaId"] != float64(5) || mutation["status"] != "COMPLETED" || mutation["scoreRaw"] != float64(70) || mutation["progress"] != float64(1) {
+		t.Fatalf("mutation variables = %#v", mutation)
+	}
+}
+
+func TestSetScoreOnlyExistingSkipsMissingEntry(t *testing.T) {
+	client := entryServer(t, 1, nil, nil)
+	applied, err := client.SetScore(context.Background(), 5, 7, true)
+	if err != nil || applied {
+		t.Fatalf("applied = %v, err = %v", applied, err)
+	}
+}
+
+func TestRemoveScore(t *testing.T) {
+	var mutation map[string]any
+	client := entryServer(t, 1, map[string]any{"id": 9, "progress": 1, "status": "COMPLETED", "score": 80}, &mutation)
+	if applied, err := client.RemoveScore(context.Background(), 1); err != nil || !applied {
+		t.Fatalf("applied = %v, err = %v", applied, err)
+	}
+	if mutation["id"] != float64(9) || mutation["scoreRaw"] != float64(0) {
+		t.Fatalf("mutation variables = %#v", mutation)
+	}
+	unscored := entryServer(t, 1, map[string]any{"id": 9, "progress": 1, "status": "COMPLETED", "score": 0}, nil)
+	if applied, err := unscored.RemoveScore(context.Background(), 1); err != nil || applied {
+		t.Fatalf("unscored: applied = %v, err = %v", applied, err)
+	}
+}
+
+func TestRatingFromScore(t *testing.T) {
+	for score, want := range map[float64]int{0: 0, 1: 1, 4: 1, 5: 1, 14: 1, 15: 2, 55: 6, 85: 9, 95: 10, 100: 10} {
+		if got := RatingFromScore(score); got != want {
+			t.Errorf("RatingFromScore(%v) = %d, want %d", score, got, want)
+		}
 	}
 }
 

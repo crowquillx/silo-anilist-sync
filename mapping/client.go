@@ -3,6 +3,7 @@ package mapping
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -17,8 +18,18 @@ type Catalog struct {
 	AniBridge    Dataset
 	AnimeLists   AnimeListsDataset
 	arm          *ARMClient
+	reverse      ReverseIndex
 	aniBridgeErr error
 	animeListErr error
+}
+
+// Reverse resolves completed AniList progress to catalog identities, using
+// the dataset's reverse index when the client built one.
+func (c Catalog) Reverse(anilistID, progress int) []MediaSource {
+	if c.reverse != nil {
+		return c.AniBridge.ReverseIndexed(c.reverse, anilistID, progress)
+	}
+	return c.AniBridge.Reverse(anilistID, progress)
 }
 
 func (c Catalog) Resolve(ctx context.Context, provider, id string, season, episode int) ([]Target, error) {
@@ -119,13 +130,67 @@ type Client struct {
 	animeListsURL string
 	httpClient    *http.Client
 	maxAge        time.Duration
+	now           func() time.Time
 
-	mu                 sync.RWMutex
-	dataset            Dataset
-	loadedAt           time.Time
-	animeLists         AnimeListsDataset
-	animeListsLoadedAt time.Time
-	arm                *ARMClient
+	mu         sync.RWMutex
+	dataset    Dataset
+	reverse    ReverseIndex
+	aniBridge  sourceState
+	animeLists AnimeListsDataset
+	animeList  sourceState
+	arm        *ARMClient
+}
+
+// sourceState tracks one downloaded dataset: when it loaded and, after a
+// failed download, when the next attempt is allowed.
+type sourceState struct {
+	loadedAt  time.Time
+	entries   int
+	failures  int
+	lastErr   error
+	lastErrAt time.Time
+	retryAt   time.Time
+}
+
+const (
+	retryBackoffBase = 2 * time.Minute
+	retryBackoffMax  = time.Hour
+)
+
+func (s *sourceState) failed(err error, now time.Time) {
+	s.failures++
+	s.lastErr, s.lastErrAt = err, now
+	backoff := retryBackoffBase << min(s.failures-1, 5)
+	s.retryAt = now.Add(min(backoff, retryBackoffMax))
+}
+
+func (s *sourceState) loaded(entries int, now time.Time) {
+	*s = sourceState{loadedAt: now, entries: entries}
+}
+
+// SourceStatus describes one mapping dataset for the status page.
+type SourceStatus struct {
+	Name      string
+	LoadedAt  time.Time
+	Entries   int
+	LastError string
+	ErrorAt   time.Time
+	RetryAt   time.Time
+}
+
+// Status reports both mapping datasets. LastError is set only while the
+// latest download attempt failed.
+func (c *Client) Status() []SourceStatus {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	status := func(name string, s sourceState) SourceStatus {
+		out := SourceStatus{Name: name, LoadedAt: s.loadedAt, Entries: s.entries, RetryAt: s.retryAt}
+		if s.lastErr != nil {
+			out.LastError, out.ErrorAt = s.lastErr.Error(), s.lastErrAt
+		}
+		return out
+	}
+	return []SourceStatus{status("AniBridge", c.aniBridge), status("Anime-Lists", c.animeList)}
 }
 
 func NewClient(httpClient *http.Client) *Client {
@@ -134,70 +199,87 @@ func NewClient(httpClient *http.Client) *Client {
 	}
 	client := &Client{
 		url: DefaultURL, animeListsURL: DefaultAnimeListsURL,
-		httpClient: httpClient, maxAge: 24 * time.Hour,
+		httpClient: httpClient, maxAge: 24 * time.Hour, now: time.Now,
 	}
 	client.arm = newARMClient(httpClient, client.maxAge)
 	return client
 }
 
+// Dataset returns the mapping catalog, downloading a dataset when it is
+// older than a day. A failed download keeps the previous copy and is not
+// retried until its backoff passes, so an outage of the mapping host does
+// not stall every request behind a download that will fail again.
 func (c *Client) Dataset(ctx context.Context) (Catalog, error) {
 	c.mu.RLock()
-	if c.fresh(c.loadedAt) && c.fresh(c.animeListsLoadedAt) {
-		catalog := c.catalog(nil, nil)
+	if !c.due(c.aniBridge) && !c.due(c.animeList) {
+		catalog, err := c.catalog()
 		c.mu.RUnlock()
-		return catalog, nil
+		return catalog, err
 	}
 	c.mu.RUnlock()
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.fresh(c.loadedAt) && c.fresh(c.animeListsLoadedAt) {
-		return c.catalog(nil, nil), nil
-	}
-
-	var aniBridgeErr error
-	if !c.fresh(c.loadedAt) {
+	if c.due(c.aniBridge) {
 		dataset, err := c.downloadAniBridge(ctx)
 		if err != nil {
-			if c.dataset == nil {
-				aniBridgeErr = &TemporaryError{Err: err}
-			}
+			c.aniBridge.failed(err, c.clock())
 		} else {
-			c.dataset = dataset
-			c.loadedAt = time.Now()
+			c.dataset, c.reverse = dataset, dataset.BuildReverseIndex()
+			c.aniBridge.loaded(len(dataset), c.clock())
 		}
 	}
-
-	var animeListErr error
-	if !c.fresh(c.animeListsLoadedAt) {
+	if c.due(c.animeList) {
 		animeLists, err := c.downloadAnimeLists(ctx)
 		if err != nil {
-			if c.animeLists == nil {
-				animeListErr = err
-			}
+			c.animeList.failed(err, c.clock())
 		} else {
 			c.animeLists = animeLists
-			c.animeListsLoadedAt = time.Now()
+			c.animeList.loaded(len(animeLists), c.clock())
 		}
+	}
+	return c.catalog()
+}
+
+// due reports whether a dataset should be downloaded now.
+func (c *Client) due(s sourceState) bool {
+	now := c.clock()
+	fresh := !s.loadedAt.IsZero() && now.Sub(s.loadedAt) < c.maxAge
+	return !fresh && !now.Before(s.retryAt)
+}
+
+func (c *Client) clock() time.Time {
+	if c.now == nil {
+		return time.Now()
+	}
+	return c.now()
+}
+
+// catalog builds the catalog from what is loaded. A dataset that never
+// loaded contributes a temporary error, so events wait for it rather than
+// being rejected for a mapping that may exist.
+func (c *Client) catalog() (Catalog, error) {
+	var aniBridgeErr, animeListErr error
+	if c.dataset == nil {
+		aniBridgeErr = &TemporaryError{Err: errOrUnavailable(c.aniBridge.lastErr, "AniBridge mappings are not loaded")}
+	}
+	if c.animeLists == nil {
+		animeListErr = &TemporaryError{Err: errOrUnavailable(c.animeList.lastErr, "Anime-Lists mappings are not loaded")}
 	}
 	if c.dataset == nil && c.animeLists == nil {
-		if aniBridgeErr != nil {
-			return Catalog{}, aniBridgeErr
-		}
-		return Catalog{}, animeListErr
+		return Catalog{}, aniBridgeErr
 	}
-	return c.catalog(aniBridgeErr, animeListErr), nil
-}
-
-func (c *Client) catalog(aniBridgeErr, animeListErr error) Catalog {
 	return Catalog{
-		AniBridge: c.dataset, AnimeLists: c.animeLists, arm: c.arm,
+		AniBridge: c.dataset, AnimeLists: c.animeLists, arm: c.arm, reverse: c.reverse,
 		aniBridgeErr: aniBridgeErr, animeListErr: animeListErr,
-	}
+	}, nil
 }
 
-func (c *Client) fresh(loadedAt time.Time) bool {
-	return !loadedAt.IsZero() && time.Since(loadedAt) < c.maxAge
+func errOrUnavailable(err error, message string) error {
+	if err != nil {
+		return err
+	}
+	return errors.New(message)
 }
 
 func (c *Client) downloadAniBridge(ctx context.Context) (Dataset, error) {

@@ -95,3 +95,78 @@ func TestClientColdStartFallsBackWhenAniBridgeIsOffline(t *testing.T) {
 		t.Fatalf("ARM calls = %d; want 1 cached lookup", armCalls)
 	}
 }
+
+func TestClientBacksOffAfterFailedDownload(t *testing.T) {
+	aniBridgeCalls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/anime-list.xml" {
+			_, _ = w.Write([]byte(`<anime-list/>`))
+			return
+		}
+		aniBridgeCalls++
+		if aniBridgeCalls == 1 {
+			_, _ = w.Write([]byte(`{"$meta":{"schema_version":"3.0.3"},"tmdb_movie:1":{"anilist:2":{}}}`))
+			return
+		}
+		http.Error(w, "offline", http.StatusServiceUnavailable)
+	}))
+	defer server.Close()
+	now := time.Date(2026, 11, 3, 12, 0, 0, 0, time.UTC)
+	client := NewClient(server.Client())
+	client.url = server.URL
+	client.animeListsURL = server.URL + "/anime-list.xml"
+	client.now = func() time.Time { return now }
+	if _, err := client.Dataset(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	now = now.Add(25 * time.Hour)
+	for range 3 {
+		catalog, err := client.Dataset(context.Background())
+		if err != nil || catalog.AniBridge["tmdb_movie:1"] == nil {
+			t.Fatalf("stale dataset should be kept: %v", err)
+		}
+	}
+	if aniBridgeCalls != 2 {
+		t.Fatalf("AniBridge downloads = %d; want one retry during backoff", aniBridgeCalls)
+	}
+	status := client.Status()[0]
+	if status.Name != "AniBridge" || status.LastError == "" || !status.RetryAt.Equal(now.Add(retryBackoffBase)) || status.Entries != 1 {
+		t.Fatalf("status = %#v", status)
+	}
+
+	now = now.Add(retryBackoffBase)
+	if _, err := client.Dataset(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if aniBridgeCalls != 3 {
+		t.Fatalf("AniBridge downloads = %d; want a retry after the backoff", aniBridgeCalls)
+	}
+	if got := client.Status()[0].RetryAt; !got.Equal(now.Add(2 * retryBackoffBase)) {
+		t.Fatalf("second backoff ends %v; want doubled", got)
+	}
+}
+
+func TestCatalogReverseUsesIndex(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/anime-list.xml" {
+			_, _ = w.Write([]byte(`<anime-list/>`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"$meta":{"schema_version":"3.0.3"},"tvdb_show:9:s1":{"anilist:2":{"1-12":"1-12"}}}`))
+	}))
+	defer server.Close()
+	client := NewClient(server.Client())
+	client.url = server.URL
+	client.animeListsURL = server.URL + "/anime-list.xml"
+	catalog, err := client.Dataset(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if catalog.reverse == nil {
+		t.Fatal("catalog has no reverse index")
+	}
+	if sources := catalog.Reverse(2, 3); len(sources) != 3 || sources[2].Episode != 3 {
+		t.Fatalf("sources = %#v", sources)
+	}
+}

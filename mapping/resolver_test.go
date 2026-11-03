@@ -156,3 +156,38 @@ func TestReverseIgnoresZeroRatioAndUnreadableRows(t *testing.T) {
 		t.Fatalf("unreadable rows should be skipped, got %#v", sources)
 	}
 }
+
+func TestMapEpisodeSkipsUnreadableRowsDeterministically(t *testing.T) {
+	ranges := map[string]string{"1-12": "1-12", "x-y": "13-24", "13-": "garbage|z"}
+	for range 200 {
+		got, ok, err := mapEpisode(ranges, 3)
+		if err != nil || !ok || got != 3 {
+			t.Fatalf("mapEpisode() = %d, %v, %v; want 3, true, nil", got, ok, err)
+		}
+	}
+	// The matching row's own target is still validated.
+	if _, _, err := mapEpisode(ranges, 14); err == nil {
+		t.Fatal("expected the unreadable matching target to fail")
+	}
+}
+
+func TestReverseIndexedMatchesReverse(t *testing.T) {
+	dataset := Dataset{
+		"tvdb_show:100:s1": {"anilist:42": {"1-12": "1-12"}, "anilist:43": {"13-24": "1-12"}},
+		"tmdb_show:55:s1":  {"anilist:42": {}},
+		"tmdb_movie:7":     {"anilist:44": {}},
+	}
+	index := dataset.BuildReverseIndex()
+	for _, test := range []struct{ id, progress int }{{42, 5}, {43, 2}, {44, 1}, {45, 1}} {
+		want := dataset.Reverse(test.id, test.progress)
+		got := dataset.ReverseIndexed(index, test.id, test.progress)
+		if len(want) != len(got) {
+			t.Fatalf("anilist %d: indexed %#v, scan %#v", test.id, got, want)
+		}
+		for i := range want {
+			if want[i].Movie != got[i].Movie || want[i].Season != got[i].Season || want[i].Episode != got[i].Episode || len(want[i].ExternalIDs) != len(got[i].ExternalIDs) {
+				t.Fatalf("anilist %d: indexed %#v, scan %#v", test.id, got, want)
+			}
+		}
+	}
+}
