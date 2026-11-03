@@ -160,6 +160,18 @@ func TestVerificationFailuresDoNotAcknowledgeZeroStops(t *testing.T) {
 			defer silo.Close()
 			event := &pluginv1.WatchSyncEvent{EventId: "retry", Operation: pluginv1.WatchSyncOperation_WATCH_SYNC_OPERATION_SCROBBLE_STOP, DurationSeconds: 1450, Media: &pluginv1.WatchSyncMedia{MediaItemId: "episode-1"}}
 			response, err := (&server{}).ApplyEvents(context.Background(), &pluginv1.WatchSyncApplyEventsRequest{Context: &pluginv1.WatchSyncAuthenticatedContext{CapabilityId: siloVerifiedCapability, Credentials: &pluginv1.WatchSyncCredentials{SecretAttributes: map[string]string{"silo.base_url": silo.URL, "silo.api_key": "silo-secret", "silo.profile_id": "profile-a"}}}, Events: []*pluginv1.WatchSyncEvent{event}})
+			if status == http.StatusUnauthorized {
+				// A rejected Silo key fails the whole batch, so Silo keeps the
+				// events and asks the profile to reconnect.
+				fault := response.GetFault()
+				if err != nil || fault.GetCode() != pluginv1.WatchSyncFaultCode_WATCH_SYNC_FAULT_CODE_INVALID_CREDENTIAL || len(response.GetResults()) != 0 {
+					t.Fatalf("response=%v error=%v", response, err)
+				}
+				if strings.Contains(fault.GetSafeMessage(), "private") || strings.Contains(fault.GetSafeMessage(), "silo-secret") {
+					t.Fatal("unsafe error")
+				}
+				return
+			}
 			if err != nil || response.GetFault() != nil || len(response.GetResults()) != 1 {
 				t.Fatalf("response=%v error=%v", response, err)
 			}

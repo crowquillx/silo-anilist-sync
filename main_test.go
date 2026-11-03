@@ -126,7 +126,7 @@ func TestMappingServiceFailureRetries(t *testing.T) {
 	if result.GetStatus() != pluginv1.WatchSyncApplyStatus_WATCH_SYNC_APPLY_STATUS_RETRY {
 		t.Fatalf("status = %v", result.GetStatus())
 	}
-	if result.GetFault().GetSafeMessage() != "temporary anime mapping service failure" {
+	if result.GetFault().GetSafeMessage() != "temporary anime mapping service failure (ARM offline)" {
 		t.Fatalf("fault = %#v", result.GetFault())
 	}
 }
@@ -136,13 +136,42 @@ func TestManifestAdvertisesWatchedImportAndDeviceCodeConfiguration(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(manifest.GetCapabilities()) != 2 {
-		t.Fatalf("capabilities = %#v", manifest.GetCapabilities())
+	capabilities := manifest.GetCapabilities()
+	if len(capabilities) != 3 || capabilities[2].GetType() != "http_routes.v1" {
+		t.Fatalf("capabilities = %#v", capabilities)
 	}
-	descriptor := manifest.GetCapabilities()[0].GetWatchSyncProvider()
-	if !descriptor.GetImportWatched() || !descriptor.GetScrobblePlayback() {
-		t.Fatalf("watch sync descriptor = %#v", descriptor)
+	for _, capability := range capabilities[:2] {
+		descriptor := capability.GetWatchSyncProvider()
+		if !descriptor.GetImportWatched() || !descriptor.GetScrobblePlayback() ||
+			!descriptor.GetImportRatings() || !descriptor.GetExportRatings() || descriptor.GetSyncDropped() ||
+			descriptor.GetMaxBatchSize() != 10 {
+			t.Fatalf("%s descriptor = %#v", capability.GetId(), descriptor)
+		}
+		requiresWatched := descriptor.GetRatingExportRequiresWatched()
+		if len(requiresWatched) != 1 || requiresWatched[0] != pluginv1.WatchSyncMediaType_WATCH_SYNC_MEDIA_TYPE_MOVIE {
+			t.Fatalf("%s rating_export_requires_watched = %v", capability.GetId(), requiresWatched)
+		}
+		var keys []string
+		for _, setting := range descriptor.GetConnectionSettings() {
+			if setting.GetType() != pluginv1.WatchSyncConnectionSettingType_WATCH_SYNC_CONNECTION_SETTING_TYPE_BOOLEAN || setting.GetDefaultValue().GetBoolValue() {
+				t.Fatalf("%s setting %#v", capability.GetId(), setting)
+			}
+			keys = append(keys, setting.GetKey())
+		}
+		if strings.Join(keys, ",") != "sync_manual_watched,only_existing_entries" {
+			t.Fatalf("%s connection settings = %v", capability.GetId(), keys)
+		}
 	}
+	routes := manifest.GetHttpRoutes()
+	if len(routes) != 4 || routes[0].GetPath() != "/" || !routes[0].GetNavigable() || routes[0].GetNavigationKind() != "admin" {
+		t.Fatalf("routes = %#v", routes)
+	}
+	for _, route := range routes {
+		if route.GetAccess() != "admin" {
+			t.Fatalf("route %s access = %q; the page lists every account", route.GetId(), route.GetAccess())
+		}
+	}
+	descriptor := capabilities[0].GetWatchSyncProvider()
 	authMethods := descriptor.GetAuthMethods()
 	if len(authMethods) != 1 || authMethods[0] != pluginv1.WatchSyncAuthMethod_WATCH_SYNC_AUTH_METHOD_DEVICE_CODE {
 		t.Fatalf("auth methods = %#v", authMethods)
@@ -207,7 +236,7 @@ func TestRemoteStatesExpandAniListProgressIntoMappedEpisodes(t *testing.T) {
 	entry.Media.Format = "TV"
 	entry.Media.Title.English = "Example Anime"
 	entry.Media.StartDate.Year = 2024
-	states := remoteStates([]anilist.ListEntry{entry}, mapping.Catalog{AniBridge: mapping.Dataset{
+	states, _ := remoteStates([]anilist.ListEntry{entry}, mapping.Catalog{AniBridge: mapping.Dataset{
 		"tvdb_show:100:s2": {"anilist:42": {"1-12": "1-12"}},
 		"tmdb_show:200:s2": {"anilist:42": {"1-12": "1-12"}},
 	}})
@@ -233,7 +262,7 @@ func TestRemoteStatesWithoutEntryTimestampOmitLastWatchedAt(t *testing.T) {
 	entry := anilist.ListEntry{ID: 9, MediaID: 42, Status: "CURRENT", Progress: 1}
 	entry.Media.ID = 42
 	entry.Media.Format = "TV"
-	states := remoteStates([]anilist.ListEntry{entry}, mapping.Catalog{AniBridge: mapping.Dataset{
+	states, _ := remoteStates([]anilist.ListEntry{entry}, mapping.Catalog{AniBridge: mapping.Dataset{
 		"tvdb_show:100:s1": {"anilist:42": {"1-12": "1-12"}},
 	}})
 	if len(states) != 1 || states[0].GetWatched().GetLastWatchedAt() != nil {
@@ -283,8 +312,17 @@ func TestRemotePageTokenRejectsMalformedValues(t *testing.T) {
 	if _, _, err := remotePageToken("1:2:3"); err == nil {
 		t.Fatal("expected malformed token to fail")
 	}
-	if page, offset, err := remotePageToken("2:7"); err != nil || page != 2 || offset != 7 {
-		t.Fatalf("remotePageToken() = %d, %d, %v", page, offset, err)
+	// A 0.7 token from a traversal that spans the upgrade still pages on.
+	if snapshot, offset, err := remotePageToken("2:7"); err != nil || snapshot != 0 || offset != 7 {
+		t.Fatalf("remotePageToken() = %d, %d, %v", snapshot, offset, err)
+	}
+	if snapshot, offset, err := remotePageToken("v2:1762171200:25"); err != nil || snapshot != 1762171200 || offset != 25 {
+		t.Fatalf("remotePageToken() = %d, %d, %v", snapshot, offset, err)
+	}
+	for _, token := range []string{"v2:0:1", "v2:5", "v2:x:1", "v2:5:-1"} {
+		if _, _, err := remotePageToken(token); err == nil {
+			t.Fatalf("expected %q to fail", token)
+		}
 	}
 }
 
@@ -539,6 +577,30 @@ func TestFaultFromError(t *testing.T) {
 			wantMessage: "AniList rejected the request (HTTP 404)",
 		},
 		{
+			name:        "invalid token answered with 400 needs a reconnect",
+			err:         &anilist.Error{Status: http.StatusBadRequest, Message: "AniList GraphQL: Invalid token", InvalidToken: true},
+			wantCode:    pluginv1.WatchSyncFaultCode_WATCH_SYNC_FAULT_CODE_INVALID_CREDENTIAL,
+			wantMessage: reconnectMessage,
+		},
+		{
+			name:        "http 401 needs a reconnect",
+			err:         &anilist.Error{Status: http.StatusUnauthorized},
+			wantCode:    pluginv1.WatchSyncFaultCode_WATCH_SYNC_FAULT_CODE_INVALID_CREDENTIAL,
+			wantMessage: reconnectMessage,
+		},
+		{
+			name:        "http 400 keeps AniList's message",
+			err:         &anilist.Error{Status: http.StatusBadRequest, Message: "AniList GraphQL: Variable \"$id\" got invalid value"},
+			wantCode:    pluginv1.WatchSyncFaultCode_WATCH_SYNC_FAULT_CODE_PERMANENT,
+			wantMessage: "AniList rejected the request (HTTP 400; AniList GraphQL: Variable \"$id\" got invalid value)",
+		},
+		{
+			name:        "mapping contradicting AniList is permanent",
+			err:         &anilist.MismatchError{Message: "mapped progress 13 exceeds AniList episode count 12"},
+			wantCode:    pluginv1.WatchSyncFaultCode_WATCH_SYNC_FAULT_CODE_PERMANENT,
+			wantMessage: "the anime mapping does not match AniList: mapped progress 13 exceeds AniList episode count 12",
+		},
+		{
 			name:        "non anilist error keeps generic message but carries detail",
 			err:         errors.New("network partition"),
 			wantCode:    pluginv1.WatchSyncFaultCode_WATCH_SYNC_FAULT_CODE_TEMPORARY,
@@ -750,10 +812,8 @@ func TestListRemoteStateContinuationAvoidsRepeatedExpansion(t *testing.T) {
 	mappings := mapping.NewClient(&http.Client{Transport: stubMappingTransport{}})
 	newServer := func() *server {
 		return &server{
-			mappings:       mappings,
-			importCache:    entries,
-			importUserID:   7,
-			importLoadedAt: time.Now(),
+			mappings: mappings,
+			imports:  seededImports(7, entries, time.Now()),
 		}
 	}
 	request := func(pageToken string) *pluginv1.WatchSyncListRemoteStateRequest {
@@ -819,10 +879,8 @@ func TestListRemoteStatePreparedCacheTracksCursorAndFullScanMode(t *testing.T) {
 		entries[index].Media.Title.Romaji = "Example Anime"
 	}
 	srv := &server{
-		mappings:       mapping.NewClient(&http.Client{Transport: stubMappingTransport{}}),
-		importCache:    entries,
-		importUserID:   7,
-		importLoadedAt: time.Now(),
+		mappings: mapping.NewClient(&http.Client{Transport: stubMappingTransport{}}),
+		imports:  seededImports(7, entries, time.Now()),
 	}
 	request := func(cursor string, fullScan bool) *pluginv1.WatchSyncListRemoteStateRequest {
 		return &pluginv1.WatchSyncListRemoteStateRequest{
@@ -909,10 +967,8 @@ func TestListRemoteStateConcurrentPagesSharePreparedSnapshot(t *testing.T) {
 		entries[index].Media.Title.Romaji = "Example Anime"
 	}
 	srv := &server{
-		mappings:       mapping.NewClient(&http.Client{Transport: stubMappingTransport{}}),
-		importCache:    entries,
-		importUserID:   7,
-		importLoadedAt: time.Now(),
+		mappings: mapping.NewClient(&http.Client{Transport: stubMappingTransport{}}),
+		imports:  seededImports(7, entries, time.Now()),
 	}
 	request := func(pageToken string) *pluginv1.WatchSyncListRemoteStateRequest {
 		return &pluginv1.WatchSyncListRemoteStateRequest{
@@ -957,4 +1013,11 @@ func TestListRemoteStateConcurrentPagesSharePreparedSnapshot(t *testing.T) {
 			t.Fatalf("concurrent continuation response = %#v", response)
 		}
 	}
+}
+
+// seededImports returns an import cache that already holds an account's list.
+func seededImports(userID int, entries []anilist.ListEntry, fetchedAt time.Time) *importCache {
+	cache := newImportCache()
+	cache.lists[userID] = &listSnapshot{entries: entries, fetchedAt: fetchedAt}
+	return cache
 }

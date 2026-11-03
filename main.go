@@ -2,27 +2,20 @@ package main
 
 import (
 	"context"
-	"crypto/sha256"
 	_ "embed"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"net/http"
-	"os"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	pluginv1 "github.com/Silo-Server/silo-plugin-sdk/pkg/pluginproto/silo/plugin/v1"
-	publicmanifest "github.com/Silo-Server/silo-plugin-sdk/pkg/pluginsdk/manifest"
 	sdkruntime "github.com/Silo-Server/silo-plugin-sdk/pkg/pluginsdk/runtime"
-	"github.com/Silo-Server/silo-plugin-sdk/pkg/pluginsdk/runtimedefault"
 	"github.com/crowquillx/silo-anilist-sync/anilist"
 	"github.com/crowquillx/silo-anilist-sync/device"
 	"github.com/crowquillx/silo-anilist-sync/mapping"
-	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
@@ -33,36 +26,24 @@ var version string
 var manifestJSON []byte
 
 type server struct {
-	runtimedefault.Server
 	pluginv1.UnimplementedWatchSyncProviderServer
+	pluginv1.UnimplementedHttpRoutesServer
 
-	manifest *pluginv1.PluginManifest
 	mappings *mapping.Client
+	// status feeds the admin page. A nil status records nothing.
+	status *statusStore
 
-	importMu       sync.Mutex
-	importCache    []anilist.ListEntry
-	importUserID   int
-	importLoadedAt time.Time
-
-	preparedMu    sync.Mutex
-	preparedCache *preparedImport
+	importsOnce sync.Once
+	imports     *importCache
 }
 
-type preparedImportKey struct {
-	userID     int
-	credential [sha256.Size]byte
-	snapshotAt time.Time
-	sinceUnix  int64
-	fullScan   bool
-}
-
-type preparedImport struct {
-	key    preparedImportKey
-	states []*pluginv1.WatchSyncRemoteState
-}
-
-func (s *server) GetManifest(context.Context, *pluginv1.GetManifestRequest) (*pluginv1.GetManifestResponse, error) {
-	return &pluginv1.GetManifestResponse{Manifest: s.manifest}, nil
+func (s *server) importCache() *importCache {
+	s.importsOnce.Do(func() {
+		if s.imports == nil {
+			s.imports = newImportCache()
+		}
+	})
+	return s.imports
 }
 
 func (s *server) ExchangeAPIKey(ctx context.Context, req *pluginv1.WatchSyncExchangeAPIKeyRequest) (*pluginv1.WatchSyncCredentialResponse, error) {
@@ -74,498 +55,54 @@ func (s *server) ExchangeAPIKey(ctx context.Context, req *pluginv1.WatchSyncExch
 	// and returns the connected account; a bad or revoked token now fails the
 	// connect with an INVALID_CREDENTIAL fault instead of at first sync. AniList
 	// tokens live ~1 year; the decoded exp lets the host warn before expiry.
+	var response *pluginv1.WatchSyncCredentialResponse
+	var err error
 	if req.GetCapabilityId() == siloVerifiedCapability {
-		return s.exchangeVerifiedCredential(ctx, req, token)
+		response, err = s.exchangeVerifiedCredential(ctx, req, token)
+	} else {
+		response, err = credentialResponse(ctx, token, "Bearer", anilist.TokenExpiresAt(token))
 	}
-	return credentialResponse(ctx, token, "Bearer", anilist.TokenExpiresAt(token))
+	if err == nil && response.GetFault() == nil {
+		s.recordAccount(ctx, req.GetCapabilityId(), response.GetAccount(), token)
+	}
+	return response, err
 }
 
 func (s *server) RefreshCredentials(context.Context, *pluginv1.WatchSyncRefreshCredentialsRequest) (*pluginv1.WatchSyncCredentialResponse, error) {
 	return &pluginv1.WatchSyncCredentialResponse{Fault: &pluginv1.WatchSyncFault{
 		Code:        pluginv1.WatchSyncFaultCode_WATCH_SYNC_FAULT_CODE_INVALID_CREDENTIAL,
-		SafeMessage: "AniList does not issue refresh tokens; reconnect the account",
+		SafeMessage: "AniList does not issue refresh tokens; reconnect AniList in Settings → Watch Providers",
 	}}, nil
 }
 
 func (s *server) GetAccount(ctx context.Context, req *pluginv1.WatchSyncGetAccountRequest) (*pluginv1.WatchSyncGetAccountResponse, error) {
-	account, err := anilist.NewClient(req.GetContext().GetCredentials().GetAccessToken(), nil).Viewer(ctx)
-	if err != nil {
-		return &pluginv1.WatchSyncGetAccountResponse{Fault: faultFromError(err)}, nil
-	}
-	return &pluginv1.WatchSyncGetAccountResponse{Account: accountProto(account)}, nil
-}
-
-func (s *server) ListRemoteState(ctx context.Context, req *pluginv1.WatchSyncListRemoteStateRequest) (*pluginv1.WatchSyncListRemoteStateResponse, error) {
-	if !requestsWatchedState(req.GetStateKinds()) {
-		return &pluginv1.WatchSyncListRemoteStateResponse{CompleteSnapshot: true, NextCursor: "full-v1"}, nil
-	}
-	page, offset, err := remotePageToken(req.GetPageToken())
-	if err != nil {
-		return &pluginv1.WatchSyncListRemoteStateResponse{Fault: invalidRequestFault(err)}, nil
-	}
-	pageSize := int(req.GetPageSize())
-	if pageSize < 1 {
-		pageSize = 25
-	}
-	if pageSize > 1000 {
-		return &pluginv1.WatchSyncListRemoteStateResponse{
-			Fault: invalidRequestFault(errors.New("remote state page size exceeds 1000 items")),
-		}, nil
-	}
 	auth := req.GetContext()
-	credentials := auth.GetCredentials()
-	client := anilist.NewClient(credentials.GetAccessToken(), nil)
-	userID, err := strconv.Atoi(credentials.GetSecretAttributes()["user_id"])
-	if err != nil || userID < 1 {
-		account, accountErr := client.Viewer(ctx)
-		if accountErr != nil {
-			return &pluginv1.WatchSyncListRemoteStateResponse{Fault: faultFromError(accountErr)}, nil
-		}
-		userID = account.ID
-	}
-	entries, fetchedAt, err := s.importEntries(ctx, client, userID)
+	token := auth.GetCredentials().GetAccessToken()
+	account, err := anilist.NewClient(token, nil).Viewer(ctx)
 	if err != nil {
-		return &pluginv1.WatchSyncListRemoteStateResponse{Fault: faultFromError(err)}, nil
+		return &pluginv1.WatchSyncGetAccountResponse{Fault: s.callFault(ctx, auth, credentialUserID(auth.GetCredentials()), err)}, nil
 	}
-	fullScan, _ := strconv.ParseBool(req.GetContext().GetProviderConfig().GetValues()["provider.import_full_scan"])
-	since := parseImportCursor(req.GetCursor())
-	incremental := !since.IsZero() && !fullScan
-	items, err := s.preparedImportStates(ctx, userID, credentials.GetAccessToken(), entries, fetchedAt, since, fullScan)
-	if err != nil {
-		return &pluginv1.WatchSyncListRemoteStateResponse{Fault: faultFromError(err)}, nil
-	}
-	if offset > len(items) {
-		return &pluginv1.WatchSyncListRemoteStateResponse{
-			Fault: invalidRequestFault(errors.New("remote state page token is out of range")),
-		}, nil
-	}
-	end := min(len(items), offset+pageSize)
-	response := &pluginv1.WatchSyncListRemoteStateResponse{
-		Items:            cloneRemoteStates(items[offset:end]),
-		CompleteSnapshot: !incremental,
-	}
-	if end < len(items) {
-		response.NextPageToken = fmt.Sprintf("%d:%d", page, end)
-	} else {
-		// The durable checkpoint is the moment the list was fetched, so the
-		// next traversal sees every entry updated at or after this snapshot.
-		response.NextCursor = formatImportCursor(fetchedAt)
-	}
-	return response, nil
+	response := accountProto(account)
+	s.recordAccount(ctx, auth.GetCapabilityId(), response, token)
+	return &pluginv1.WatchSyncGetAccountResponse{Account: response}, nil
 }
 
-// entriesChangedSince keeps list entries updated at or after the traversal
-// checkpoint. The inclusive boundary closes the race where an entry is
-// updated in the same second the previous snapshot was fetched. A zero time
-// (full scan) keeps everything.
-func entriesChangedSince(entries []anilist.ListEntry, since time.Time) []anilist.ListEntry {
-	if since.IsZero() {
-		return entries
+// recordAccount notes a connected account for the status page.
+func (s *server) recordAccount(ctx context.Context, capability string, account *pluginv1.WatchSyncAccount, token string) {
+	id, err := strconv.Atoi(account.GetExternalSubject())
+	if err != nil || id < 1 {
+		return
 	}
-	filtered := make([]anilist.ListEntry, 0, len(entries))
-	for _, entry := range entries {
-		if int64(entry.UpdatedAt) >= since.Unix() {
-			filtered = append(filtered, entry)
-		}
-	}
-	return filtered
+	s.status.recordAccount(ctx, capability, anilist.Account{ID: id, Name: account.GetUsername(), ProfileURL: account.GetProfileUrl()}, token)
 }
 
-const (
-	importCursorPrefix = "inc:"
-	// importCacheTTL covers a whole remote-state traversal so every page
-	// observes one stable list snapshot; a full traversal pages through
-	// Silo's host one batch at a time and can outlive short TTLs.
-	importCacheTTL = 30 * time.Minute
-)
-
-// parseImportCursor reads the durable traversal checkpoint. Empty or
-// unrecognized cursors (first run, pre-0.6.0 "full-v1", another format)
-// mean a full traversal.
-func parseImportCursor(cursor string) time.Time {
-	trimmed, ok := strings.CutPrefix(strings.TrimSpace(cursor), importCursorPrefix)
-	if !ok {
-		return time.Time{}
-	}
-	sec, err := strconv.ParseInt(trimmed, 10, 64)
-	if err != nil || sec <= 0 {
-		return time.Time{}
-	}
-	return time.Unix(sec, 0).UTC()
-}
-
-// formatImportCursor renders the checkpoint for the given list snapshot.
-func formatImportCursor(fetchedAt time.Time) string {
-	if fetchedAt.IsZero() {
-		fetchedAt = time.Now().UTC()
-	}
-	return importCursorPrefix + strconv.FormatInt(fetchedAt.Unix(), 10)
-}
-
-// importEntries loads the account's anime list once per user and caches it
-// so a multi-page remote-state traversal costs a single AniList request and
-// every page observes one stable snapshot. Failures are never cached; the
-// next page retries upstream. The returned time is when that snapshot was
-// fetched; it anchors the durable incremental cursor.
-func (s *server) importEntries(ctx context.Context, client *anilist.Client, userID int) ([]anilist.ListEntry, time.Time, error) {
-	s.importMu.Lock()
-	if s.importUserID == userID && !s.importLoadedAt.IsZero() && time.Since(s.importLoadedAt) < importCacheTTL {
-		entries, fetchedAt := s.importCache, s.importLoadedAt
-		s.importMu.Unlock()
-		return entries, fetchedAt, nil
-	}
-	entries, err := client.ListEntries(ctx, userID)
-	if err != nil {
-		s.importMu.Unlock()
-		return nil, time.Time{}, err
-	}
-	s.importCache = entries
-	s.importUserID = userID
-	s.importLoadedAt = time.Now().UTC()
-	fetchedAt := s.importLoadedAt
-	s.preparedMu.Lock()
-	s.preparedCache = nil
-	s.preparedMu.Unlock()
-	s.importMu.Unlock()
-	return entries, fetchedAt, nil
-}
-
-// preparedImportStates expands one imported list snapshot once for the
-// effective traversal mode. The single cache entry is intentionally bounded;
-// a changed account, credential, snapshot, cursor, or full-scan setting
-// replaces it. The mutex covers mapping lookup and expansion so concurrent
-// pages cannot duplicate the expensive work.
-func (s *server) preparedImportStates(ctx context.Context, userID int, accessToken string, entries []anilist.ListEntry, fetchedAt, since time.Time, fullScan bool) ([]*pluginv1.WatchSyncRemoteState, error) {
-	key := preparedImportKey{
-		userID:     userID,
-		credential: sha256.Sum256([]byte(accessToken)),
-		snapshotAt: fetchedAt,
-		sinceUnix:  since.Unix(),
-		fullScan:   fullScan,
-	}
-	s.preparedMu.Lock()
-	defer s.preparedMu.Unlock()
-	if s.preparedCache != nil && s.preparedCache.key == key {
-		return s.preparedCache.states, nil
-	}
-	dataset, err := s.mappings.Dataset(ctx)
-	if err != nil {
-		return nil, err
-	}
-	if !since.IsZero() && !fullScan {
-		entries = entriesChangedSince(entries, since)
-	}
-	states := remoteStates(entries, dataset)
-	s.preparedCache = &preparedImport{key: key, states: states}
-	return states, nil
-}
-
-func cloneRemoteStates(states []*pluginv1.WatchSyncRemoteState) []*pluginv1.WatchSyncRemoteState {
-	if len(states) == 0 {
-		return nil
-	}
-	cloned := make([]*pluginv1.WatchSyncRemoteState, len(states))
-	for index, state := range states {
-		cloned[index] = proto.Clone(state).(*pluginv1.WatchSyncRemoteState)
-	}
-	return cloned
-}
-
-func requestsWatchedState(kinds []pluginv1.WatchSyncRemoteStateKind) bool {
-	if len(kinds) == 0 {
-		return true
-	}
-	for _, kind := range kinds {
-		if kind == pluginv1.WatchSyncRemoteStateKind_WATCH_SYNC_REMOTE_STATE_KIND_WATCHED {
-			return true
-		}
-	}
-	return false
-}
-
-func remotePageToken(token string) (int, int, error) {
-	if strings.TrimSpace(token) == "" {
-		return 1, 0, nil
-	}
-	parts := strings.Split(token, ":")
-	if len(parts) != 2 {
-		return 0, 0, errors.New("remote state page token is invalid")
-	}
-	page, pageErr := strconv.Atoi(parts[0])
-	offset, offsetErr := strconv.Atoi(parts[1])
-	if pageErr != nil || offsetErr != nil || page < 1 || offset < 0 {
-		return 0, 0, errors.New("remote state page token is invalid")
-	}
-	return page, offset, nil
-}
-
-func remoteStates(entries []anilist.ListEntry, dataset mapping.Catalog) []*pluginv1.WatchSyncRemoteState {
-	var states []*pluginv1.WatchSyncRemoteState
-	for _, entry := range entries {
-		progress := entry.CompletedProgress()
-		if progress < 1 || entry.Media.ID < 1 || entry.ID < 1 {
-			continue
-		}
-		sources := dataset.AniBridge.Reverse(entry.Media.ID, progress)
-		// Silo's host silently drops watched states without a timestamp, so
-		// surface AniList's entry-level update time as the last play. AniList
-		// has no per-episode dates; this is when the user last marked progress.
-		watched := &pluginv1.WatchSyncRemoteWatchedState{PlayCount: 1}
-		if entry.UpdatedAt > 0 {
-			watched.LastWatchedAt = timestamppb.New(time.Unix(int64(entry.UpdatedAt), 0).UTC())
-		}
-		expectMovie := entry.Media.Format == "MOVIE"
-		hasExpectedSource := false
-		for _, source := range sources {
-			hasExpectedSource = hasExpectedSource || source.Movie == expectMovie
-		}
-		for _, source := range sources {
-			if hasExpectedSource && source.Movie != expectMovie {
-				continue
-			}
-			externalIDs := make(map[string]string, len(source.ExternalIDs)+1)
-			for provider, id := range source.ExternalIDs {
-				externalIDs[provider] = id
-			}
-			externalIDs["anilist"] = strconv.Itoa(entry.Media.ID)
-			media := &pluginv1.WatchSyncMedia{
-				Title: entry.PreferredTitle(),
-				Year:  int32(entry.Media.StartDate.Year),
-			}
-			var itemKey string
-			if source.Movie {
-				media.MediaType = pluginv1.WatchSyncMediaType_WATCH_SYNC_MEDIA_TYPE_MOVIE
-				media.ExternalIds = externalIDs
-				itemKey = fmt.Sprintf("anilist:%d:movie", entry.ID)
-			} else {
-				media.MediaType = pluginv1.WatchSyncMediaType_WATCH_SYNC_MEDIA_TYPE_EPISODE
-				media.SeriesTitle = entry.PreferredTitle()
-				media.SeriesYear = int32(entry.Media.StartDate.Year)
-				media.SeriesExternalIds = externalIDs
-				media.SeasonNumber = int32(source.Season)
-				media.EpisodeNumber = int32(source.Episode)
-				itemKey = fmt.Sprintf("anilist:%d:s%d:e%d", entry.ID, source.Season, source.Episode)
-			}
-			states = append(states, &pluginv1.WatchSyncRemoteState{
-				ProviderItemKey: itemKey,
-				Media:           media,
-				Watched:         watched,
-			})
-		}
-	}
-	return states
-}
-
-func (s *server) ApplyEvents(ctx context.Context, req *pluginv1.WatchSyncApplyEventsRequest) (*pluginv1.WatchSyncApplyEventsResponse, error) {
-	if len(req.GetEvents()) == 0 {
-		return &pluginv1.WatchSyncApplyEventsResponse{}, nil
-	}
-	behavior := watchBehaviorFromConfig(req.GetContext().GetProviderConfig())
-	verified := make([]bool, len(req.GetEvents()))
-	results := make([]*pluginv1.WatchSyncApplyResult, len(req.GetEvents()))
-	needsMapping := false
-	for i, event := range req.GetEvents() {
-		var err error
-		verified[i], err = verifyZeroStop(ctx, req.GetContext(), event)
-		if err != nil {
-			results[i] = siloVerificationErrorResult(event.GetEventId(), err)
-			continue
-		}
-		needsMapping = needsMapping || verified[i] || appliesWatchedState(event, behavior)
-	}
-	var dataset mapping.Catalog
-	var client *anilist.Client
-	if needsMapping {
-		var err error
-		dataset, err = s.mappings.Dataset(ctx)
-		if err != nil {
-			return &pluginv1.WatchSyncApplyEventsResponse{Fault: faultFromError(err)}, nil
-		}
-		client = anilist.NewClient(req.GetContext().GetCredentials().GetAccessToken(), nil)
-	}
-	for i, event := range req.GetEvents() {
-		if results[i] == nil {
-			results[i] = applyVerifiedEvent(ctx, client, dataset, event, behavior, verified[i])
-		}
-	}
-	return &pluginv1.WatchSyncApplyEventsResponse{Results: results}, nil
-}
-
-type watchBehavior struct {
-	syncManualWatched         bool
-	playbackCompletionPercent float64
-	onlyExistingEntries       bool
-}
-
-func watchBehaviorFromConfig(config *pluginv1.WatchSyncProviderConfig) watchBehavior {
-	behavior := watchBehavior{playbackCompletionPercent: 90}
-	if config == nil {
-		return behavior
-	}
-	behavior.syncManualWatched, _ = strconv.ParseBool(config.GetValues()["provider.sync_manual_watched"])
-	behavior.onlyExistingEntries, _ = strconv.ParseBool(config.GetValues()["provider.only_existing_entries"])
-	if threshold, err := strconv.ParseFloat(config.GetValues()["provider.playback_completion_percent"], 64); err == nil &&
-		threshold >= 1 && threshold <= 99 {
-		behavior.playbackCompletionPercent = threshold
-	}
-	return behavior
-}
-
-func appliesWatchedState(event *pluginv1.WatchSyncEvent, behavior watchBehavior) bool {
-	switch event.GetOperation() {
-	case pluginv1.WatchSyncOperation_WATCH_SYNC_OPERATION_SCROBBLE_STOP:
-		return event.GetCompletionPercent() > behavior.playbackCompletionPercent
-	case pluginv1.WatchSyncOperation_WATCH_SYNC_OPERATION_MARK_WATCHED:
-		return event.GetOrigin() == pluginv1.WatchSyncOrigin_WATCH_SYNC_ORIGIN_PLAYBACK_COMPLETION ||
-			behavior.syncManualWatched
-	default:
-		return false
-	}
-}
-
-func applyEvent(ctx context.Context, client *anilist.Client, dataset mapping.Catalog, event *pluginv1.WatchSyncEvent, behavior watchBehavior) *pluginv1.WatchSyncApplyResult {
-	return applyVerifiedEvent(ctx, client, dataset, event, behavior, false)
-}
-
-func applyVerifiedEvent(ctx context.Context, client *anilist.Client, dataset mapping.Catalog, event *pluginv1.WatchSyncEvent, behavior watchBehavior, siloPlayed bool) *pluginv1.WatchSyncApplyResult {
-	result := &pluginv1.WatchSyncApplyResult{EventId: event.GetEventId()}
-	switch event.GetOperation() {
-	case pluginv1.WatchSyncOperation_WATCH_SYNC_OPERATION_SCROBBLE_START,
-		pluginv1.WatchSyncOperation_WATCH_SYNC_OPERATION_SCROBBLE_PAUSE:
-		result.Status = pluginv1.WatchSyncApplyStatus_WATCH_SYNC_APPLY_STATUS_NO_CHANGE
-		return result
-	case pluginv1.WatchSyncOperation_WATCH_SYNC_OPERATION_SCROBBLE_STOP,
-		pluginv1.WatchSyncOperation_WATCH_SYNC_OPERATION_MARK_WATCHED:
-		if !appliesWatchedState(event, behavior) && !(siloPlayed && event.GetOperation() == pluginv1.WatchSyncOperation_WATCH_SYNC_OPERATION_SCROBBLE_STOP) {
-			result.Status = pluginv1.WatchSyncApplyStatus_WATCH_SYNC_APPLY_STATUS_NO_CHANGE
-			return result
-		}
-	default:
-		result.Status = pluginv1.WatchSyncApplyStatus_WATCH_SYNC_APPLY_STATUS_REJECTED
-		result.Fault = &pluginv1.WatchSyncFault{
-			Code:        pluginv1.WatchSyncFaultCode_WATCH_SYNC_FAULT_CODE_PERMANENT,
-			SafeMessage: "AniList does not support this watch synchronization operation",
-		}
-		return result
-	}
-	targets, err := resolveTargets(ctx, dataset, event.GetMedia())
-	if err != nil {
-		var mappingErr *mapping.TemporaryError
-		if errors.As(err, &mappingErr) {
-			return applyErrorResult(event.GetEventId(), err)
-		}
-		result.Status = pluginv1.WatchSyncApplyStatus_WATCH_SYNC_APPLY_STATUS_REJECTED
-		result.Fault = &pluginv1.WatchSyncFault{
-			Code:        pluginv1.WatchSyncFaultCode_WATCH_SYNC_FAULT_CODE_INVALID_REQUEST,
-			SafeMessage: err.Error(),
-		}
-		return result
-	}
-	if len(targets) == 0 {
-		result.Status = pluginv1.WatchSyncApplyStatus_WATCH_SYNC_APPLY_STATUS_REJECTED
-		result.Fault = &pluginv1.WatchSyncFault{
-			Code:        pluginv1.WatchSyncFaultCode_WATCH_SYNC_FAULT_CODE_PERMANENT,
-			SafeMessage: "no unambiguous AniBridge, Anime-Lists, or ARM mapping was found",
-		}
-		return result
-	}
-	ids := make([]int, 0, len(targets))
-	for id := range targets {
-		ids = append(ids, id)
-	}
-	sort.Ints(ids)
-	applied := !behavior.onlyExistingEntries
-	for _, id := range ids {
-		if behavior.onlyExistingEntries {
-			updated, err := client.AdvanceProgressIfExisting(ctx, id, targets[id])
-			if err != nil {
-				return applyErrorResult(event.GetEventId(), err)
-			}
-			applied = applied || updated
-			continue
-		}
-		if err := client.AdvanceProgress(ctx, id, targets[id]); err != nil {
-			return applyErrorResult(event.GetEventId(), err)
-		}
-	}
-	if !applied {
-		result.Status = pluginv1.WatchSyncApplyStatus_WATCH_SYNC_APPLY_STATUS_NO_CHANGE
-		return result
-	}
-	result.Status = pluginv1.WatchSyncApplyStatus_WATCH_SYNC_APPLY_STATUS_APPLIED
-	return result
-}
-
-func resolveTargets(ctx context.Context, dataset mapping.Catalog, media *pluginv1.WatchSyncMedia) (map[int]int, error) {
-	if media == nil {
-		return nil, errors.New("watch event has no media identity")
-	}
-	season, episode := int(media.GetSeasonNumber()), int(media.GetEpisodeNumber())
-	ids := media.GetSeriesExternalIds()
-	switch media.GetMediaType() {
-	case pluginv1.WatchSyncMediaType_WATCH_SYNC_MEDIA_TYPE_MOVIE:
-		season, episode = -1, 1
-		ids = media.GetExternalIds()
-	case pluginv1.WatchSyncMediaType_WATCH_SYNC_MEDIA_TYPE_EPISODE:
-		if season < 0 || episode < 1 {
-			return nil, errors.New("episode watch events require season and episode numbers")
-		}
-	default:
-		return nil, fmt.Errorf("unsupported watch media type %q", media.GetMediaType())
-	}
-	return convergedMappings(ctx, dataset, ids, season, episode)
-}
-
-func convergedMappings(ctx context.Context, dataset mapping.Catalog, ids map[string]string, season, episode int) (map[int]int, error) {
-	var resolved map[int]int
-	for _, provider := range []string{"tvdb", "tmdb"} {
-		providerID := strings.TrimSpace(ids[provider])
-		if providerID == "" {
-			continue
-		}
-		targets, err := dataset.Resolve(ctx, provider, providerID, season, episode)
-		if err != nil {
-			return nil, err
-		}
-		if len(targets) == 0 {
-			continue
-		}
-		candidate := targetsMap(targets)
-		if resolved != nil && !sameTargets(resolved, candidate) {
-			return nil, fmt.Errorf("anime mappings disagree between provider IDs")
-		}
-		resolved = candidate
-	}
-	if resolved == nil && season < 0 && strings.TrimSpace(ids["imdb"]) != "" {
-		targets, err := dataset.Resolve(ctx, "imdb", ids["imdb"], season, episode)
-		if err != nil {
-			return nil, err
-		}
-		resolved = targetsMap(targets)
-	}
-	return resolved, nil
-}
-
-func targetsMap(targets []mapping.Target) map[int]int {
-	out := make(map[int]int, len(targets))
-	for _, target := range targets {
-		if target.Episode > out[target.AniListID] {
-			out[target.AniListID] = target.Episode
-		}
-	}
-	return out
-}
-
-func sameTargets(a, b map[int]int) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for id, progress := range a {
-		if b[id] != progress {
-			return false
-		}
-	}
-	return true
+// callFault converts a failed AniList call to a fault and records it for the
+// account's status.
+func (s *server) callFault(ctx context.Context, auth *pluginv1.WatchSyncAuthenticatedContext, userID int, err error) *pluginv1.WatchSyncFault {
+	fault := faultFromError(err)
+	invalid := fault.GetCode() == pluginv1.WatchSyncFaultCode_WATCH_SYNC_FAULT_CODE_INVALID_CREDENTIAL
+	s.status.recordCall(ctx, userID, auth.GetCapabilityId(), auth.GetCredentials().GetAccessToken(), invalid, fault.GetSafeMessage())
+	return fault
 }
 
 func credentialResponse(ctx context.Context, accessToken, tokenType string, expiresAt time.Time) (*pluginv1.WatchSyncCredentialResponse, error) {
@@ -611,11 +148,21 @@ func invalidRequestFault(err error) *pluginv1.WatchSyncFault {
 	return &pluginv1.WatchSyncFault{Code: pluginv1.WatchSyncFaultCode_WATCH_SYNC_FAULT_CODE_INVALID_REQUEST, SafeMessage: err.Error()}
 }
 
+// reconnectMessage is shown on the profile's Watch Providers page when
+// AniList rejects the saved token.
+const reconnectMessage = "AniList rejected the saved access token because it expired or was revoked. Reconnect AniList in Settings → Watch Providers."
+
 func faultFromError(err error) *pluginv1.WatchSyncFault {
 	fault := &pluginv1.WatchSyncFault{Code: pluginv1.WatchSyncFaultCode_WATCH_SYNC_FAULT_CODE_TEMPORARY, SafeMessage: "temporary AniList request failure"}
 	var mappingErr *mapping.TemporaryError
 	if errors.As(err, &mappingErr) {
-		fault.SafeMessage = "temporary anime mapping service failure"
+		fault.SafeMessage = "temporary anime mapping service failure" + transportDetail(mappingErr.Err)
+		return fault
+	}
+	var mismatch *anilist.MismatchError
+	if errors.As(err, &mismatch) {
+		fault.Code = pluginv1.WatchSyncFaultCode_WATCH_SYNC_FAULT_CODE_PERMANENT
+		fault.SafeMessage = "the anime mapping does not match AniList: " + mismatch.Message
 		return fault
 	}
 	var apiErr *anilist.Error
@@ -623,10 +170,15 @@ func faultFromError(err error) *pluginv1.WatchSyncFault {
 		fault.SafeMessage += transportDetail(err)
 		return fault
 	}
+	if apiErr.InvalidToken {
+		fault.Code = pluginv1.WatchSyncFaultCode_WATCH_SYNC_FAULT_CODE_INVALID_CREDENTIAL
+		fault.SafeMessage = reconnectMessage
+		return fault
+	}
 	switch apiErr.Status {
 	case http.StatusUnauthorized:
 		fault.Code = pluginv1.WatchSyncFaultCode_WATCH_SYNC_FAULT_CODE_INVALID_CREDENTIAL
-		fault.SafeMessage = "AniList credentials are expired or revoked"
+		fault.SafeMessage = reconnectMessage
 	case http.StatusForbidden:
 		fault.Code = pluginv1.WatchSyncFaultCode_WATCH_SYNC_FAULT_CODE_PERMISSION_DENIED
 		fault.SafeMessage = "AniList denied the request"
@@ -689,38 +241,12 @@ func transportDetail(err error) string {
 }
 
 func main() {
-	manifest, err := loadManifest()
-	if err != nil {
-		panic(err)
+	srv := &server{mappings: mapping.NewClient(nil), status: newStatusStore()}
+	authorization := device.NewService()
+	authorization.OnAuthorized = func(ctx context.Context, account anilist.Account, token string) {
+		srv.status.recordAccount(ctx, "anilist", account, token)
 	}
-	srv := &server{manifest: manifest, mappings: mapping.NewClient(nil)}
-	servers := sdkruntime.CapabilityServers{
-		Runtime:           srv,
-		WatchSyncProvider: srv,
-	}
-	sdkruntime.Serve(sdkruntime.ServeConfig{
-		Servers: servers,
-		Plugins: sdkruntime.DefaultPluginSetWithWatchSyncDeviceAuthorization(servers, device.NewService()),
-	})
-}
-
-func loadManifest() (*pluginv1.PluginManifest, error) {
-	manifest, err := publicmanifest.Load(manifestJSON)
-	if err != nil {
-		return nil, fmt.Errorf("load embedded manifest: %w", err)
-	}
-	if version != "" {
-		manifest.Version = version
-	}
-	path, err := os.Executable()
-	if err != nil {
-		return nil, fmt.Errorf("resolve executable: %w", err)
-	}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, fmt.Errorf("read executable: %w", err)
-	}
-	checksum := sha256.Sum256(data)
-	manifest.Checksum = hex.EncodeToString(checksum[:])
-	return manifest, nil
+	sdkruntime.ServeManifestWithOptions(manifestJSON, version,
+		sdkruntime.CapabilityServers{WatchSyncProvider: srv, HttpRoutes: srv},
+		sdkruntime.WithWatchSyncDeviceAuthorization(authorization))
 }

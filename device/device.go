@@ -32,6 +32,9 @@ var now = time.Now
 
 type Service struct {
 	pluginv1.UnimplementedWatchSyncDeviceAuthorizationServiceServer
+
+	// OnAuthorized, when set, is told about each account that connects.
+	OnAuthorized func(ctx context.Context, account anilist.Account, token string)
 }
 
 func NewService() *Service {
@@ -144,6 +147,9 @@ func (s *Service) authorized(ctx context.Context, code string, env *envelope) (*
 	if expiresAt := anilist.TokenExpiresAt(token); !expiresAt.IsZero() {
 		credentials.ExpiresAt = timestamppb.New(expiresAt)
 	}
+	if s.OnAuthorized != nil {
+		s.OnAuthorized(ctx, account, token)
+	}
 	return &pluginv1.WatchSyncDeviceAuthorizationServicePollResponse{
 		Status:      pluginv1.WatchSyncDeviceAuthorizationStatus_WATCH_SYNC_DEVICE_AUTHORIZATION_STATUS_AUTHORIZED,
 		Credentials: credentials,
@@ -224,6 +230,11 @@ func faultFromError(err error) *pluginv1.WatchSyncFault {
 	var apiErr *anilist.Error
 	if !errors.As(err, &apiErr) {
 		fault.SafeMessage += transportDetail(err)
+		return fault
+	}
+	if apiErr.InvalidToken {
+		fault.Code = pluginv1.WatchSyncFaultCode_WATCH_SYNC_FAULT_CODE_INVALID_CREDENTIAL
+		fault.SafeMessage = "AniList credentials are expired or revoked"
 		return fault
 	}
 	switch apiErr.Status {

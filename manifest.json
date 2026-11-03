@@ -1,6 +1,6 @@
 {
   "plugin_id": "dev.crowquillx.anilist-sync",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "checksum": "__CHECKSUM__",
   "silo_api_version": "v1",
   "supported_platforms": [
@@ -22,7 +22,7 @@
       "type": "watch_sync_provider.v1",
       "id": "anilist",
       "display_name": "AniList",
-      "description": "Syncs completed playback and optionally manual watched marks to AniList, and imports mapped watch history.",
+      "description": "Syncs completed playback, optionally manual watched marks, and movie ratings to AniList, and imports mapped watch history and movie ratings.",
       "watch_sync_provider": {
         "auth_methods": [
           "WATCH_SYNC_AUTH_METHOD_DEVICE_CODE"
@@ -42,14 +42,35 @@
           "tvdb"
         ],
         "scrobble_playback": true,
-        "max_batch_size": 25
+        "max_batch_size": 10,
+        "import_ratings": true,
+        "export_ratings": true,
+        "rating_export_requires_watched": [
+          "WATCH_SYNC_MEDIA_TYPE_MOVIE"
+        ],
+        "connection_settings": [
+          {
+            "key": "sync_manual_watched",
+            "label": "Send manually marked watched items",
+            "description": "Also update AniList when you mark an episode or movie watched without playing it. The plugin's global setting turns this on for every profile.",
+            "type": "WATCH_SYNC_CONNECTION_SETTING_TYPE_BOOLEAN",
+            "default_value": false
+          },
+          {
+            "key": "only_existing_entries",
+            "label": "Only update anime already on my AniList list",
+            "description": "Skip anime that are not on your AniList list yet, so a wrong match cannot add a title. Add titles to Plan to Watch before watching. The plugin's global setting turns this on for every profile.",
+            "type": "WATCH_SYNC_CONNECTION_SETTING_TYPE_BOOLEAN",
+            "default_value": false
+          }
+        ]
       }
     },
     {
       "type": "watch_sync_provider.v1",
       "id": "anilist-silo",
       "display_name": "AniList with Silo watched check",
-      "description": "Checks the selected Silo profile for watched state when a player stops at zero. Connect with an AniList token and a Silo API key.",
+      "description": "Checks the selected Silo profile for watched state when a player stops at zero. Connect with an AniList token and a Silo API key. Also syncs movie ratings.",
       "watch_sync_provider": {
         "auth_methods": [
           "WATCH_SYNC_AUTH_METHOD_API_KEY"
@@ -69,7 +90,28 @@
           "tvdb"
         ],
         "scrobble_playback": true,
-        "max_batch_size": 25
+        "max_batch_size": 10,
+        "import_ratings": true,
+        "export_ratings": true,
+        "rating_export_requires_watched": [
+          "WATCH_SYNC_MEDIA_TYPE_MOVIE"
+        ],
+        "connection_settings": [
+          {
+            "key": "sync_manual_watched",
+            "label": "Send manually marked watched items",
+            "description": "Also update AniList when you mark an episode or movie watched without playing it. The plugin's global setting turns this on for every profile.",
+            "type": "WATCH_SYNC_CONNECTION_SETTING_TYPE_BOOLEAN",
+            "default_value": false
+          },
+          {
+            "key": "only_existing_entries",
+            "label": "Only update anime already on my AniList list",
+            "description": "Skip anime that are not on your AniList list yet, so a wrong match cannot add a title. Add titles to Plan to Watch before watching. The plugin's global setting turns this on for every profile.",
+            "type": "WATCH_SYNC_CONNECTION_SETTING_TYPE_BOOLEAN",
+            "default_value": false
+          }
+        ]
       },
       "config_schema": [
         {
@@ -107,6 +149,12 @@
           }
         }
       ]
+    },
+    {
+      "type": "http_routes.v1",
+      "id": "status",
+      "display_name": "AniList Sync page",
+      "description": "Administrator page with connected accounts, unmapped titles, recent problems and mapping data."
     }
   ],
   "global_config_schema": [
@@ -121,14 +169,14 @@
           {
             "key": "sync_manual_watched",
             "label": "Sync manually marked watched items",
-            "description": "Also send items marked watched without being played. The existing-entry restriction applies to both playback and manual marks when enabled.",
+            "description": "Also send items marked watched without being played, for every profile. Each profile can also turn this on for itself in Settings → Watch Providers. The existing-entry restriction applies to manual marks too.",
             "control": "ADMIN_FORM_CONTROL_SWITCH",
             "default_value": false
           },
           {
             "key": "playback_completion_percent",
             "label": "Playback completion threshold",
-            "description": "Playback must pass this percentage before AniList progress advances. Match Silo's watched threshold.",
+            "description": "Used only when Silo does not say whether playback finished, as older Silo versions do not. Current Silo versions decide with their own watched threshold.",
             "control": "ADMIN_FORM_CONTROL_NUMBER",
             "required": true,
             "default_value": 90,
@@ -141,15 +189,15 @@
           },
           {
             "key": "import_full_scan",
-            "label": "Full import scan",
-            "description": "Rescan the complete AniList list on the next sync instead of only entries changed since the last scan. Turn off again afterwards to resume fast incremental syncs.",
+            "label": "Full import rescan",
+            "description": "Turning this on rescans each connected account's whole AniList list once, on its next sync. Later syncs only read changes again. Turn it off and on to rescan again, or use Rescan on the AniList Sync page.",
             "control": "ADMIN_FORM_CONTROL_SWITCH",
             "default_value": false
           },
           {
             "key": "only_existing_entries",
             "label": "Only update anime already on AniList",
-            "description": "Skip exports for anime absent from the connected account's list. Add titles to Plan to Watch before watching. Reduces unwanted additions from false matches; does not filter Silo libraries or watched-history imports.",
+            "description": "Skip exports for anime absent from the connected account's list, for every profile. Each profile can also turn this on for itself. Add titles to Plan to Watch before watching. Reduces unwanted additions from false matches; does not filter Silo libraries or watched-history imports.",
             "control": "ADMIN_FORM_CONTROL_SWITCH",
             "default_value": false
           }
@@ -161,9 +209,9 @@
   "category": "Integrations/Tracking",
   "presentation": {
     "display_name": "AniList Sync",
-    "summary": "Reliably synchronize completed anime with AniList through Silo's watch-provider pipeline.",
-    "description_markdown": "Uses Silo's host-owned watch-sync pipeline for encrypted per-profile credentials, durable playback completion delivery, optional manual watched marks, retries, imports, and rich episode identity. Episode exports prefer the daily AniBridge v3 dataset, with an Anime-Lists and ARM fallback. Watch-history imports reverse-map AniList progress through AniBridge. AniList progress is monotonic and ambiguous mappings are rejected rather than guessed.",
-    "setup_markdown": "Install the plugin and match the playback completion threshold to Silo's watched threshold. To connect a profile, open Settings \u2192 Watch Providers \u2192 AniList and select Connect. Silo shows a code and a button that opens the activation page; enter the code, approve access on AniList, and return to Silo \u2014 the connection completes automatically and shows your account. AniList tokens last about one year; reconnect when the credential expires. A manual paste flow remains documented in the plugin README as a fallback. For Neptune or Jellycompat players that report a stop at zero, connect the optional AniList with Silo watched check provider using an AniList access token, your Silo server URL, a Silo API key, and the current Silo profile ID. This connection checks saved watched state for that exact item and profile. See the README for setup; disconnect the ordinary AniList provider for that profile to avoid duplicate synchronization.",
+    "summary": "Syncs anime watch progress and movie ratings with AniList through Silo's watch-provider pipeline.",
+    "description_markdown": "Uses Silo's host-owned watch-sync pipeline for encrypted per-profile credentials, durable playback completion delivery, optional manual watched marks, retries, imports, and rich episode identity. Episode exports prefer the daily AniBridge v3 dataset, with an Anime-Lists and ARM fallback. Watch-history imports reverse-map AniList progress through AniBridge. Movie ratings sync both ways. AniList progress is monotonic and ambiguous mappings are rejected rather than guessed. An administrator page lists connected accounts, unmapped titles and recent problems.",
+    "setup_markdown": "To connect a profile, open Settings → Watch Providers → AniList and select Connect. Silo shows a code and a button that opens the activation page; enter the code, approve access on AniList, and return to Silo. The connection completes automatically and shows your account. AniList tokens last about one year; when one expires, Silo asks you to reconnect. Administrators can check every connection on the AniList Sync page in the admin menu. For players that report a stop at zero, connect the optional AniList with Silo watched check provider instead, using an AniList access token, your Silo server URL, a Silo API key and the current Silo profile ID; see the README. Requires a Silo server from September 24, 2026 or later.",
     "homepage_url": "https://github.com/crowquillx/silo-anilist-sync",
     "source_url": "https://github.com/crowquillx/silo-anilist-sync",
     "support_url": "https://github.com/crowquillx/silo-anilist-sync/issues",
@@ -171,5 +219,34 @@
     "publisher_name": "crowquillx",
     "publisher_url": "https://github.com/crowquillx",
     "license_spdx": "MIT"
-  }
+  },
+  "http_routes": [
+    {
+      "id": "status-page",
+      "method": "GET",
+      "path": "/",
+      "access": "admin",
+      "navigable": true,
+      "navigation_label": "AniList Sync",
+      "navigation_kind": "admin"
+    },
+    {
+      "id": "status-json",
+      "method": "GET",
+      "path": "/status",
+      "access": "admin"
+    },
+    {
+      "id": "rescan",
+      "method": "POST",
+      "path": "/rescan",
+      "access": "admin"
+    },
+    {
+      "id": "clear-problems",
+      "method": "POST",
+      "path": "/clear-problems",
+      "access": "admin"
+    }
+  ]
 }
