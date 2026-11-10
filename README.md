@@ -16,7 +16,7 @@ For players that report completed playback at position zero, use **AniList with 
 
 ## What syncs
 
-- **Watch progress.** Finished episodes and movies advance AniList progress, never lower it. Watching a planned, paused or dropped anime moves it to Watching, and the last episode completes it. Finishing a rewatch completes it and counts the rewatch.
+- **Watch progress.** Finished episodes and movies advance AniList progress, never lower it. Silo's own watched threshold decides when a play is finished. A finished play that could not be sent, for example while AniList was down, is sent with Silo's next sync. Watching a planned, paused or dropped anime moves it to Watching, and the last episode completes it. Finishing a rewatch completes it and counts the rewatch.
 - **Movie ratings.** Ratings sync both ways for movies, converted between Silo's 1 to 10 and AniList's 100-point scores. Series ratings and dropped shows are not synced, because one Silo series usually spans several AniList entries.
 - **History imports.** AniList progress is mapped back to TVDB, TMDB or IMDb episodes and movies through AniBridge. After the first sync, imports read only entries changed since the last one.
 

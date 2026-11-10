@@ -32,6 +32,16 @@ func (c Catalog) Reverse(anilistID, progress int) []MediaSource {
 	return c.AniBridge.Reverse(anilistID, progress)
 }
 
+// ReverseUnavailable returns a temporary error when the AniBridge dataset,
+// the only source Reverse reads, has not loaded. A catalog built from
+// Anime-Lists alone can resolve exports but maps no AniList entry back.
+func (c Catalog) ReverseUnavailable() error {
+	if c.AniBridge == nil {
+		return c.aniBridgeErr
+	}
+	return nil
+}
+
 func (c Catalog) Resolve(ctx context.Context, provider, id string, season, episode int) ([]Target, error) {
 	direct, directErr := c.AniBridge.Resolve(provider, id, season, episode)
 	if directErr == nil && len(direct) > 0 {

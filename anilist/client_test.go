@@ -539,3 +539,35 @@ func TestLimiterStretchesIntervalAcrossRemainingBudget(t *testing.T) {
 		t.Fatalf("interval = %v, want roughly 60s", interval)
 	}
 }
+
+func TestOversizedResponseIsReportedAsTooLarge(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		// Valid JSON once whole, so cutting it at the limit used to surface
+		// as a decode error.
+		_, _ = w.Write([]byte(`{"data":{"Viewer":{"id":7,"name":"`))
+		_, _ = w.Write([]byte(strings.Repeat("x", 4<<20)))
+		_, _ = w.Write([]byte(`"}}}`))
+	}))
+	defer server.Close()
+	client := NewClient("token", server.Client())
+	client.Endpoint = server.URL
+	_, err := client.Viewer(context.Background())
+	var tooLarge *ResponseTooLargeError
+	if !errors.As(err, &tooLarge) || tooLarge.Limit != 4<<20 || err.Error() != "AniList response too large: over 4 MiB" {
+		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestResponseAtTheSizeLimitIsRead(t *testing.T) {
+	const prefix, suffix = `{"data":{"Viewer":{"id":7,"name":"`, `"}}}`
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(prefix + strings.Repeat("x", 4<<20-len(prefix)-len(suffix)) + suffix))
+	}))
+	defer server.Close()
+	client := NewClient("token", server.Client())
+	client.Endpoint = server.URL
+	account, err := client.Viewer(context.Background())
+	if err != nil || account.ID != 7 {
+		t.Fatalf("account = %#v, err = %v", account, err)
+	}
+}

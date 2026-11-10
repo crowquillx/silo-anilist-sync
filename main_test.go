@@ -209,12 +209,21 @@ func TestManifestAdvertisesWatchedImportAndDeviceCodeConfiguration(t *testing.T)
 		t.Fatalf("schema required = %#v", jsonSchema.Required)
 	}
 	fields := schema.GetAdminForm().GetFields()
-	if len(fields) != 4 || fields[0].GetKey() != "sync_manual_watched" ||
-		fields[1].GetKey() != "playback_completion_percent" ||
-		fields[2].GetKey() != "import_full_scan" ||
-		fields[3].GetKey() != "only_existing_entries" ||
-		fields[3].GetDefaultValue() == nil || fields[3].GetDefaultValue().GetBoolValue() {
+	if len(fields) != 3 || fields[0].GetKey() != "sync_manual_watched" ||
+		fields[1].GetKey() != "import_full_scan" ||
+		fields[2].GetKey() != "only_existing_entries" ||
+		fields[2].GetDefaultValue() == nil || fields[2].GetDefaultValue().GetBoolValue() {
 		t.Fatalf("provider fields = %#v", fields)
+	}
+	// Earlier versions saved playback_completion_percent, and
+	// the schema rejects unknown keys, so the ignored property stays declared.
+	if _, ok := jsonSchema.Properties["playback_completion_percent"]; !ok {
+		t.Fatal("schema must still accept the ignored playback_completion_percent")
+	}
+	// Every setting has a default, so a new install must be able to connect
+	// before an administrator saves the settings.
+	if schema.GetRequired() {
+		t.Fatal("provider settings must not be required")
 	}
 }
 
@@ -471,7 +480,7 @@ func TestManualWatchedMarksRequireExplicitToggle(t *testing.T) {
 	}
 }
 
-func TestPlaybackStopUsesConfiguredCompletionThreshold(t *testing.T) {
+func TestPlaybackStopFollowsSiloCompletedFlag(t *testing.T) {
 	calls := 0
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		calls++
@@ -492,7 +501,7 @@ func TestPlaybackStopUsesConfiguredCompletionThreshold(t *testing.T) {
 	event := &pluginv1.WatchSyncEvent{
 		EventId:           "playback-1",
 		Operation:         pluginv1.WatchSyncOperation_WATCH_SYNC_OPERATION_SCROBBLE_STOP,
-		CompletionPercent: 90,
+		CompletionPercent: 95,
 		Media: &pluginv1.WatchSyncMedia{
 			MediaType:         pluginv1.WatchSyncMediaType_WATCH_SYNC_MEDIA_TYPE_EPISODE,
 			SeasonNumber:      1,
@@ -500,13 +509,18 @@ func TestPlaybackStopUsesConfiguredCompletionThreshold(t *testing.T) {
 			SeriesExternalIds: map[string]string{"tvdb": "1"},
 		},
 	}
+	// A threshold saved by an earlier version is ignored: Silo's completed
+	// flag alone decides, whatever the position.
 	behavior := watchBehaviorFromConfig(&pluginv1.WatchSyncProviderConfig{Values: map[string]string{
 		"provider.playback_completion_percent": "90",
 	}})
 	if result := applyEvent(context.Background(), client, dataset, event, behavior); result.GetStatus() != pluginv1.WatchSyncApplyStatus_WATCH_SYNC_APPLY_STATUS_NO_CHANGE {
-		t.Fatalf("threshold status = %v", result.GetStatus())
+		t.Fatalf("unfinished status = %v", result.GetStatus())
 	}
-	event.CompletionPercent = 90.1
+	if calls != 0 {
+		t.Fatalf("unfinished playback made %d AniList calls", calls)
+	}
+	event.Completed = true
 	if result := applyEvent(context.Background(), client, dataset, event, behavior); result.GetStatus() != pluginv1.WatchSyncApplyStatus_WATCH_SYNC_APPLY_STATUS_APPLIED {
 		t.Fatalf("completed status = %v, fault = %#v", result.GetStatus(), result.GetFault())
 	}
