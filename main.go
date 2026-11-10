@@ -32,6 +32,9 @@ type server struct {
 	mappings *mapping.Client
 	// status feeds the admin page. A nil status records nothing.
 	status *statusStore
+	// pending remembers finished plays not yet applied. A nil pending
+	// remembers nothing.
+	pending *pendingCompletions
 
 	importsOnce sync.Once
 	imports     *importCache
@@ -159,6 +162,14 @@ func faultFromError(err error) *pluginv1.WatchSyncFault {
 		fault.SafeMessage = "temporary anime mapping service failure" + transportDetail(mappingErr.Err)
 		return fault
 	}
+	var tooLarge *anilist.ResponseTooLargeError
+	if errors.As(err, &tooLarge) {
+		// The same request returns the same oversized answer, so retrying
+		// cannot help.
+		fault.Code = pluginv1.WatchSyncFaultCode_WATCH_SYNC_FAULT_CODE_PERMANENT
+		fault.SafeMessage = tooLarge.Error()
+		return fault
+	}
 	var mismatch *anilist.MismatchError
 	if errors.As(err, &mismatch) {
 		fault.Code = pluginv1.WatchSyncFaultCode_WATCH_SYNC_FAULT_CODE_PERMANENT
@@ -241,7 +252,7 @@ func transportDetail(err error) string {
 }
 
 func main() {
-	srv := &server{mappings: mapping.NewClient(nil), status: newStatusStore()}
+	srv := &server{mappings: mapping.NewClient(nil), status: newStatusStore(), pending: newPendingCompletions()}
 	authorization := device.NewService()
 	authorization.OnAuthorized = func(ctx context.Context, account anilist.Account, token string) {
 		srv.status.recordAccount(ctx, "anilist", account, token)

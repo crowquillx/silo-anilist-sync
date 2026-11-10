@@ -178,13 +178,13 @@ func TestEventsPastTheDeadlineAreDeferredAsRateLimited(t *testing.T) {
 	}
 }
 
-func TestSiloCompletedFlagWinsOverThreshold(t *testing.T) {
-	stop := &pluginv1.WatchSyncEvent{Operation: pluginv1.WatchSyncOperation_WATCH_SYNC_OPERATION_SCROBBLE_STOP, CompletionPercent: 85}
-	behavior := watchBehavior{playbackCompletionPercent: 90}
+func TestOnlySiloCompletedFlagAppliesAStop(t *testing.T) {
+	stop := &pluginv1.WatchSyncEvent{Operation: pluginv1.WatchSyncOperation_WATCH_SYNC_OPERATION_SCROBBLE_STOP, CompletionPercent: 99}
+	behavior := watchBehavior{}
 	if appliesWatchedState(stop, behavior) {
-		t.Fatal("85% without completed must not apply at a 90% threshold")
+		t.Fatal("a stop Silo did not mark completed must not apply, whatever its position")
 	}
-	stop.Completed = true
+	stop.Completed, stop.CompletionPercent = true, 85
 	if !appliesWatchedState(stop, behavior) {
 		t.Fatal("Silo's completed flag must apply")
 	}

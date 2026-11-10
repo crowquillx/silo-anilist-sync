@@ -30,8 +30,10 @@ const (
 	maxCachedLists = 8
 	// pageTokenPrefix starts a page token that names its list snapshot.
 	pageTokenPrefix = "v2:"
-	// maxWarningTitles is how many unmapped titles one warning names.
+	// maxWarningTitles is how many unmapped titles one warning names at most.
 	maxWarningTitles = 10
+	// maxWarningBytes is where Silo cuts a page warning.
+	maxWarningBytes = 300
 )
 
 var errSnapshotChanged = errors.New("AniList list changed during the import; the next sync starts it again")
@@ -337,24 +339,39 @@ func ratingStates(entries []anilist.ListEntry, dataset mapping.Catalog) []*plugi
 }
 
 // unmappedWarnings tells the sync run which watched entries were not
-// imported because no mapping covers them.
+// imported because no mapping covers them. Silo cuts a warning at
+// maxWarningBytes, so the count and where to find the full list come first
+// and only as many titles are named as fit.
 func unmappedWarnings(unmapped []anilist.ListEntry) []string {
 	if len(unmapped) == 0 {
 		return nil
 	}
-	titles := make([]string, 0, min(len(unmapped), maxWarningTitles))
-	for _, entry := range unmapped[:min(len(unmapped), maxWarningTitles)] {
-		titles = append(titles, entry.PreferredTitle())
-	}
-	subject := fmt.Sprintf("%d AniList entries have no TVDB, TMDB or IMDb mapping and were", len(unmapped))
+	warning := fmt.Sprintf("%d AniList entries have no TVDB, TMDB or IMDb mapping and were not imported. The AniList Sync admin page lists them.", len(unmapped))
 	if len(unmapped) == 1 {
-		subject = "1 AniList entry has no TVDB, TMDB or IMDb mapping and was"
+		warning = "1 AniList entry has no TVDB, TMDB or IMDb mapping and was not imported. The AniList Sync admin page lists it."
 	}
-	warning := subject + " not imported: " + strings.Join(titles, ", ")
-	if more := len(unmapped) - len(titles); more > 0 {
-		warning += fmt.Sprintf(", and %d more", more)
+	// ending closes the list after the given number of named titles.
+	ending := func(named int) string {
+		if more := len(unmapped) - named; more > 0 {
+			return fmt.Sprintf(", and %d more.", more)
+		}
+		return "."
 	}
-	return []string{warning + ". The AniList Sync admin page lists them."}
+	titles, named := "", 0
+	for _, entry := range unmapped[:min(len(unmapped), maxWarningTitles)] {
+		candidate := titles + ", " + entry.PreferredTitle()
+		if named == 0 {
+			candidate = " Not imported: " + entry.PreferredTitle()
+		}
+		if len(warning)+len(candidate)+len(ending(named+1)) > maxWarningBytes {
+			break
+		}
+		titles, named = candidate, named+1
+	}
+	if named == 0 {
+		return []string{warning}
+	}
+	return []string{warning + titles + ending(named)}
 }
 
 func cloneRemoteStates(states []*pluginv1.WatchSyncRemoteState) []*pluginv1.WatchSyncRemoteState {
@@ -490,6 +507,11 @@ func (c *importCache) prepare(ctx context.Context, key preparedKey, build func(m
 	}
 	dataset, err := mappings.Dataset(ctx)
 	if err != nil {
+		return nil, err
+	}
+	// Without the reverse mappings every entry would look unmapped, and Silo
+	// would take the empty page for the account's whole state.
+	if err := dataset.ReverseUnavailable(); err != nil {
 		return nil, err
 	}
 	prepared := build(dataset)

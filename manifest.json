@@ -162,8 +162,8 @@
       "key": "provider",
       "title": "AniList provider settings",
       "description": "Watched synchronization behavior.",
-      "json_schema": "{\"type\":\"object\",\"additionalProperties\":false,\"properties\":{\"sync_manual_watched\":{\"type\":\"boolean\",\"default\":false},\"playback_completion_percent\":{\"type\":\"number\",\"minimum\":1,\"maximum\":99,\"default\":90},\"import_full_scan\":{\"type\":\"boolean\",\"default\":false},\"only_existing_entries\":{\"type\":\"boolean\",\"default\":false}}}",
-      "required": true,
+      "json_schema": "{\"type\":\"object\",\"additionalProperties\":false,\"properties\":{\"sync_manual_watched\":{\"type\":\"boolean\",\"default\":false},\"playback_completion_percent\":{\"type\":\"number\",\"description\":\"Ignored. Silo decides when playback counts as finished. Kept so settings saved by earlier versions stay valid.\"},\"import_full_scan\":{\"type\":\"boolean\",\"default\":false},\"only_existing_entries\":{\"type\":\"boolean\",\"default\":false}}}",
+      "required": false,
       "admin_form": {
         "fields": [
           {
@@ -172,20 +172,6 @@
             "description": "Also send items marked watched without being played, for every profile. Each profile can also turn this on for itself in Settings → Watch Providers. The existing-entry restriction applies to manual marks too.",
             "control": "ADMIN_FORM_CONTROL_SWITCH",
             "default_value": false
-          },
-          {
-            "key": "playback_completion_percent",
-            "label": "Playback completion threshold",
-            "description": "Used only when Silo does not say whether playback finished, as older Silo versions do not. Current Silo versions decide with their own watched threshold.",
-            "control": "ADMIN_FORM_CONTROL_NUMBER",
-            "required": true,
-            "default_value": 90,
-            "validation": {
-              "has_min": true,
-              "min": 1,
-              "has_max": true,
-              "max": 99
-            }
           },
           {
             "key": "import_full_scan",

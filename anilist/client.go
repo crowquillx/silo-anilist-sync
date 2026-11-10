@@ -53,6 +53,16 @@ type MismatchError struct {
 
 func (e *MismatchError) Error() string { return e.Message }
 
+// ResponseTooLargeError reports an AniList response larger than the client
+// reads. Repeating the request returns the same response.
+type ResponseTooLargeError struct {
+	Limit int64
+}
+
+func (e *ResponseTooLargeError) Error() string {
+	return fmt.Sprintf("AniList response too large: over %d MiB", e.Limit>>20)
+}
+
 func (e *Error) Error() string {
 	if e.Message != "" {
 		return e.Message
@@ -569,9 +579,14 @@ func (c *Client) doWithLimit(ctx context.Context, httpClient *http.Client, query
 		apiErr.InvalidToken = apiErr.InvalidToken || resp.StatusCode == http.StatusUnauthorized
 		return apiErr
 	}
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxBytes))
+	// One byte past the limit shows that the body is larger, so it is reported
+	// as too large and not as broken JSON.
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxBytes+1))
 	if err != nil {
 		return fmt.Errorf("read AniList response: %w", err)
+	}
+	if int64(len(raw)) > maxBytes {
+		return &ResponseTooLargeError{Limit: maxBytes}
 	}
 	var envelope struct {
 		Errors []graphQLError `json:"errors"`

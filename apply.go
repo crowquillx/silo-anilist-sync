@@ -40,7 +40,11 @@ func (s *server) ApplyEvents(ctx context.Context, req *pluginv1.WatchSyncApplyEv
 	behavior := watchBehaviorFromContext(auth)
 	verified := make([]bool, len(events))
 	results := make([]*pluginv1.WatchSyncApplyResult, len(events))
+	// Finished plays are noted as pending before any request is made for
+	// them, and forgotten once their outcome is final. See pending.go.
+	pendingKeys, behaviors := s.notePendingCompletions(ctx, userID, events, behavior)
 	needsMapping := false
+	var verifiedKeys []string
 	for i, event := range events {
 		var err error
 		verified[i], err = verifyZeroStop(ctx, auth, event)
@@ -48,8 +52,14 @@ func (s *server) ApplyEvents(ctx context.Context, req *pluginv1.WatchSyncApplyEv
 			results[i] = siloVerificationErrorResult(event.GetEventId(), err)
 			continue
 		}
-		needsMapping = needsMapping || needsAniList(event, behavior, verified[i])
+		if verified[i] && pendingKeys[i] == "" {
+			if pendingKeys[i] = pendingKey(userID, event); pendingKeys[i] != "" {
+				verifiedKeys = append(verifiedKeys, pendingKeys[i])
+			}
+		}
+		needsMapping = needsMapping || needsAniList(event, behaviors[i], verified[i])
 	}
+	s.pending.add(ctx, verifiedKeys)
 	var dataset mapping.Catalog
 	var client *anilist.Client
 	if needsMapping {
@@ -64,7 +74,7 @@ func (s *server) ApplyEvents(ctx context.Context, req *pluginv1.WatchSyncApplyEv
 	failure := ""
 	deferred := false
 	for i, event := range events {
-		reachesAniList := results[i] == nil && needsAniList(event, behavior, verified[i])
+		reachesAniList := results[i] == nil && needsAniList(event, behaviors[i], verified[i])
 		if results[i] == nil {
 			// Silo gives each call a deadline. Events that may not finish in
 			// time are handed back as rate limited, so Silo sends them again
@@ -74,7 +84,7 @@ func (s *server) ApplyEvents(ctx context.Context, req *pluginv1.WatchSyncApplyEv
 				results[i] = deferredResult(event.GetEventId())
 				continue
 			}
-			results[i] = applyVerifiedEvent(ctx, client, dataset, event, behavior, verified[i])
+			results[i] = applyVerifiedEvent(ctx, client, dataset, event, behaviors[i], verified[i])
 		}
 		if fault := results[i].GetFault(); fault.GetCode() == pluginv1.WatchSyncFaultCode_WATCH_SYNC_FAULT_CODE_INVALID_CREDENTIAL {
 			// A rejected credential fails every event. Report it for the
@@ -92,11 +102,47 @@ func (s *server) ApplyEvents(ctx context.Context, req *pluginv1.WatchSyncApplyEv
 			}
 		}
 	}
+	var settled []string
+	for i, key := range pendingKeys {
+		if key != "" && pendingResultIsFinal(results[i]) {
+			settled = append(settled, key)
+		}
+	}
+	s.pending.remove(ctx, settled)
 	s.status.recordExports(ctx, userID, outcomes)
 	if needsMapping {
 		s.status.recordCall(ctx, userID, auth.GetCapabilityId(), auth.GetCredentials().GetAccessToken(), false, failure)
 	}
 	return &pluginv1.WatchSyncApplyEventsResponse{Results: results}, nil
+}
+
+// notePendingCompletions records the batch's finished plays as pending and
+// returns, per event, the pending play it concerns (empty for none) and the
+// behavior to apply. A watched mark for a pending play is the retry of a
+// finished play whose first delivery did not complete, so it is applied even
+// when manual marks are not synced.
+func (s *server) notePendingCompletions(ctx context.Context, userID int, events []*pluginv1.WatchSyncEvent, behavior watchBehavior) ([]string, []watchBehavior) {
+	keys := make([]string, len(events))
+	behaviors := make([]watchBehavior, len(events))
+	var finished []string
+	for i, event := range events {
+		behaviors[i] = behavior
+		switch event.GetOperation() {
+		case pluginv1.WatchSyncOperation_WATCH_SYNC_OPERATION_SCROBBLE_STOP:
+			if appliesWatchedState(event, behavior) {
+				if keys[i] = pendingKey(userID, event); keys[i] != "" {
+					finished = append(finished, keys[i])
+				}
+			}
+		case pluginv1.WatchSyncOperation_WATCH_SYNC_OPERATION_MARK_WATCHED:
+			if key := pendingKey(userID, event); s.pending.has(ctx, key) {
+				keys[i] = key
+				behaviors[i].syncManualWatched = true
+			}
+		}
+	}
+	s.pending.add(ctx, finished)
+	return keys, behaviors
 }
 
 // deadlineTooClose reports whether one more export might not finish before
@@ -135,9 +181,8 @@ func needsAniList(event *pluginv1.WatchSyncEvent, behavior watchBehavior, siloPl
 }
 
 type watchBehavior struct {
-	syncManualWatched         bool
-	playbackCompletionPercent float64
-	onlyExistingEntries       bool
+	syncManualWatched   bool
+	onlyExistingEntries bool
 }
 
 // watchBehaviorFromContext combines the plugin's global settings with the
@@ -154,27 +199,26 @@ func watchBehaviorFromContext(auth *pluginv1.WatchSyncAuthenticatedContext) watc
 	return behavior
 }
 
+// watchBehaviorFromConfig reads the global settings. Installs from before
+// Silo reported completion may still have provider.playback_completion_percent
+// saved; it is ignored.
 func watchBehaviorFromConfig(config *pluginv1.WatchSyncProviderConfig) watchBehavior {
-	behavior := watchBehavior{playbackCompletionPercent: 90}
+	var behavior watchBehavior
 	if config == nil {
 		return behavior
 	}
 	behavior.syncManualWatched, _ = strconv.ParseBool(config.GetValues()["provider.sync_manual_watched"])
 	behavior.onlyExistingEntries, _ = strconv.ParseBool(config.GetValues()["provider.only_existing_entries"])
-	if threshold, err := strconv.ParseFloat(config.GetValues()["provider.playback_completion_percent"], 64); err == nil &&
-		threshold >= 1 && threshold <= 99 {
-		behavior.playbackCompletionPercent = threshold
-	}
 	return behavior
 }
 
 // appliesWatchedState reports whether an event marks its item watched. Silo
-// decides itself whether playback finished and says so in completed; the
-// plugin's threshold covers Silo versions that do not send it.
+// decides with its own watched threshold whether playback finished and says
+// so in completed; the plugin does not second-guess it from the position.
 func appliesWatchedState(event *pluginv1.WatchSyncEvent, behavior watchBehavior) bool {
 	switch event.GetOperation() {
 	case pluginv1.WatchSyncOperation_WATCH_SYNC_OPERATION_SCROBBLE_STOP:
-		return event.GetCompleted() || event.GetCompletionPercent() > behavior.playbackCompletionPercent
+		return event.GetCompleted()
 	case pluginv1.WatchSyncOperation_WATCH_SYNC_OPERATION_MARK_WATCHED:
 		return event.GetOrigin() == pluginv1.WatchSyncOrigin_WATCH_SYNC_ORIGIN_PLAYBACK_COMPLETION ||
 			behavior.syncManualWatched
