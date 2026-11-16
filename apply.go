@@ -70,6 +70,7 @@ func (s *server) ApplyEvents(ctx context.Context, req *pluginv1.WatchSyncApplyEv
 		}
 		client = anilist.NewClient(auth.GetCredentials().GetAccessToken(), nil)
 	}
+	shoko := s.exportShokoLookup(auth)
 	var outcomes []exportOutcome
 	failure := ""
 	deferred := false
@@ -84,7 +85,7 @@ func (s *server) ApplyEvents(ctx context.Context, req *pluginv1.WatchSyncApplyEv
 				results[i] = deferredResult(event.GetEventId())
 				continue
 			}
-			results[i] = applyVerifiedEvent(ctx, client, dataset, event, behaviors[i], verified[i])
+			results[i] = applyVerifiedEvent(ctx, client, dataset, event, behaviors[i], verified[i], shoko)
 		}
 		if fault := results[i].GetFault(); fault.GetCode() == pluginv1.WatchSyncFaultCode_WATCH_SYNC_FAULT_CODE_INVALID_CREDENTIAL {
 			// A rejected credential fails every event. Report it for the
@@ -228,10 +229,12 @@ func appliesWatchedState(event *pluginv1.WatchSyncEvent, behavior watchBehavior)
 }
 
 func applyEvent(ctx context.Context, client *anilist.Client, dataset mapping.Catalog, event *pluginv1.WatchSyncEvent, behavior watchBehavior) *pluginv1.WatchSyncApplyResult {
-	return applyVerifiedEvent(ctx, client, dataset, event, behavior, false)
+	return applyVerifiedEvent(ctx, client, dataset, event, behavior, false, nil)
 }
 
-func applyVerifiedEvent(ctx context.Context, client *anilist.Client, dataset mapping.Catalog, event *pluginv1.WatchSyncEvent, behavior watchBehavior, siloPlayed bool) *pluginv1.WatchSyncApplyResult {
+// applyVerifiedEvent applies one event. shoko, set for a connection with
+// Silo access, reads episode files so Shoko VFS episodes map by AniDB.
+func applyVerifiedEvent(ctx context.Context, client *anilist.Client, dataset mapping.Catalog, event *pluginv1.WatchSyncEvent, behavior watchBehavior, siloPlayed bool, shoko shokoLookup) *pluginv1.WatchSyncApplyResult {
 	result := &pluginv1.WatchSyncApplyResult{EventId: event.GetEventId()}
 	switch event.GetOperation() {
 	case pluginv1.WatchSyncOperation_WATCH_SYNC_OPERATION_SCROBBLE_START,
@@ -250,7 +253,7 @@ func applyVerifiedEvent(ctx context.Context, client *anilist.Client, dataset map
 	default:
 		return rejected(result, pluginv1.WatchSyncFaultCode_WATCH_SYNC_FAULT_CODE_PERMANENT, "AniList does not support this watch synchronization operation")
 	}
-	targets, failed := mappedTargets(ctx, dataset, event, result)
+	targets, failed := mappedEventTargets(ctx, dataset, event, result, shoko)
 	if failed != nil {
 		return failed
 	}

@@ -62,6 +62,15 @@ func (s *server) ListRemoteState(ctx context.Context, req *pluginv1.WatchSyncLis
 		}, nil
 	}
 	auth := req.GetContext()
+	// A verified connection first learns the profile's Shoko VFS shows, so
+	// no state lands on a VFS show by its TVDB, TMDB or IMDb numbering.
+	var shokoShows *shokoIndex
+	if watched {
+		var indexErr error
+		if shokoShows, indexErr = s.importShokoIndex(ctx, auth); indexErr != nil {
+			return &pluginv1.WatchSyncListRemoteStateResponse{Fault: shokoIndexFault(indexErr)}, nil
+		}
+	}
 	credentials := auth.GetCredentials()
 	client := anilist.NewClient(credentials.GetAccessToken(), nil)
 	userID := credentialUserID(credentials)
@@ -97,6 +106,9 @@ func (s *server) ListRemoteState(ctx context.Context, req *pluginv1.WatchSyncLis
 		if incremental {
 			key.sinceUnix = since.Unix()
 		}
+		if shokoShows != nil {
+			key.shokoIndexAt = shokoShows.builtAt
+		}
 	}
 	prepared, err := s.importCache().prepare(ctx, key, func(dataset mapping.Catalog) *preparedImport {
 		if ratings {
@@ -107,9 +119,9 @@ func (s *server) ListRemoteState(ctx context.Context, req *pluginv1.WatchSyncLis
 		if incremental {
 			entries = entriesChangedSince(entries, time.Unix(key.sinceUnix, 0))
 		}
-		states, unmapped := remoteStates(entries, dataset)
+		states, unmapped, shokoSkipped := remoteStatesWithShoko(entries, dataset, shokoShows)
 		return &preparedImport{states: states, summary: importSummary{
-			full: !incremental, entries: len(entries), states: len(states), unmapped: unmapped,
+			full: !incremental, entries: len(entries), states: len(states), unmapped: unmapped, shokoSkipped: shokoSkipped,
 		}}
 	}, s.mappings)
 	if err != nil {
@@ -136,7 +148,7 @@ func (s *server) ListRemoteState(ctx context.Context, req *pluginv1.WatchSyncLis
 		// The durable checkpoint is the moment the list was fetched, so the
 		// next traversal sees every entry updated at or after this snapshot.
 		response.NextCursor = formatImportCursor(snapshot.fetchedAt)
-		response.Warnings = unmappedWarnings(prepared.summary.unmapped)
+		response.Warnings = append(unmappedWarnings(prepared.summary.unmapped), shokoSkippedWarnings(prepared.summary.shokoSkipped)...)
 	}
 	s.status.recordImport(ctx, userID, prepared.summary, ratings)
 	return response, nil
@@ -244,16 +256,23 @@ func formatPageToken(snapshotAt time.Time, offset int) string {
 // remoteStates expands list progress into mapped episodes and movies. It also
 // returns the watched entries that no mapping covers.
 func remoteStates(entries []anilist.ListEntry, dataset mapping.Catalog) ([]*pluginv1.WatchSyncRemoteState, []anilist.ListEntry) {
+	states, unmapped, _ := remoteStatesWithShoko(entries, dataset, nil)
+	return states, unmapped
+}
+
+// remoteStatesWithShoko is remoteStates for a profile whose Shoko VFS shows
+// are known. A TVDB, TMDB or IMDb state for a VFS show is dropped, because
+// the show's seasons follow the Shoko group. The entry's AniDB episodes are
+// emitted instead, naming each VFS episode by its own external IDs. It also
+// returns how many entries were left with no state because only VFS shows
+// matched their TVDB, TMDB or IMDb mappings. A nil index changes nothing.
+func remoteStatesWithShoko(entries []anilist.ListEntry, dataset mapping.Catalog, shows *shokoIndex) ([]*pluginv1.WatchSyncRemoteState, []anilist.ListEntry, int) {
 	var states []*pluginv1.WatchSyncRemoteState
 	var unmapped []anilist.ListEntry
+	skipped := 0
 	for _, entry := range entries {
 		progress := entry.CompletedProgress()
 		if progress < 1 || entry.Media.ID < 1 || entry.ID < 1 {
-			continue
-		}
-		sources := dataset.Reverse(entry.Media.ID, progress)
-		if len(sources) == 0 {
-			unmapped = append(unmapped, entry)
 			continue
 		}
 		// Silo's host silently drops watched states without a timestamp, so
@@ -263,21 +282,63 @@ func remoteStates(entries []anilist.ListEntry, dataset mapping.Catalog) ([]*plug
 		if entry.UpdatedAt > 0 {
 			watched.LastWatchedAt = timestamppb.New(time.Unix(int64(entry.UpdatedAt), 0).UTC())
 		}
+		var entryStates []*pluginv1.WatchSyncRemoteState
+		if shows != nil {
+			seen := make(map[string]struct{})
+			for _, source := range dataset.ReverseAniDB(entry.Media.ID, progress) {
+				key := shokoAniDBKey{anime: source.AnimeID, scope: source.Scope, number: source.Episode}
+				episode, ok := shows.episode(key.anime, key.scope, key.number)
+				if !ok || len(episode.ids) == 0 {
+					continue
+				}
+				if _, dup := seen[episode.contentID]; dup {
+					continue
+				}
+				seen[episode.contentID] = struct{}{}
+				entryStates = append(entryStates, shokoEpisodeState(entry.ID, entry.PreferredTitle(), key, episode, watched))
+			}
+		}
+		sources := dataset.Reverse(entry.Media.ID, progress)
+		if len(sources) == 0 && len(entryStates) == 0 {
+			unmapped = append(unmapped, entry)
+			continue
+		}
 		expectMovie := entry.Media.Format == "MOVIE"
 		hasExpectedSource := false
 		for _, source := range sources {
 			hasExpectedSource = hasExpectedSource || source.Movie == expectMovie
 		}
+		dropped := false
 		for _, source := range sources {
 			if hasExpectedSource && source.Movie != expectMovie {
 				continue
 			}
+			if !source.Movie && shows.isShow(source.ExternalIDs) {
+				dropped = true
+				continue
+			}
 			state := &pluginv1.WatchSyncRemoteState{Watched: watched}
 			state.ProviderItemKey, state.Media = sourceIdentity(entry, source)
-			states = append(states, state)
+			entryStates = append(entryStates, state)
 		}
+		if dropped && len(entryStates) == 0 {
+			skipped++
+		}
+		states = append(states, entryStates...)
 	}
-	return states, unmapped
+	return states, unmapped, skipped
+}
+
+// shokoSkippedWarnings tells the sync run about entries that only Shoko VFS
+// shows matched by TVDB, TMDB or IMDb numbering.
+func shokoSkippedWarnings(skipped int) []string {
+	switch {
+	case skipped == 1:
+		return []string{"1 AniList entry maps only to a Shoko VFS show by TVDB, TMDB or IMDb numbering, which the Shoko group order does not follow, and was not imported: its AniDB episodes are not in Silo."}
+	case skipped > 1:
+		return []string{fmt.Sprintf("%d AniList entries map only to Shoko VFS shows by TVDB, TMDB or IMDb numbering, which the Shoko group order does not follow, and were not imported: their AniDB episodes are not in Silo.", skipped)}
+	}
+	return nil
 }
 
 // sourceIdentity is the provider key and Silo media identity of one mapped
@@ -417,6 +478,8 @@ type preparedKey struct {
 	snapshotAt time.Time
 	sinceUnix  int64
 	ratings    bool
+	// shokoIndexAt is when the Shoko VFS index the states used was read.
+	shokoIndexAt time.Time
 }
 
 type preparedImport struct {

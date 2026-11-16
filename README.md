@@ -20,6 +20,15 @@ For players that report completed playback at position zero, use **AniList with 
 - **Movie ratings.** Ratings sync both ways for movies, converted between Silo's 1 to 10 and AniList's 100-point scores. Series ratings and dropped shows are not synced, because one Silo series usually spans several AniList entries.
 - **History imports.** AniList progress is mapped back to TVDB, TMDB or IMDb episodes and movies through AniBridge. After the first sync, imports read only entries changed since the last one.
 
+## Shoko VFS libraries
+
+A library built by the [ShokoAnime VFS](https://github.com/crowquillx/silo-shoko-plugin) plugin follows your Shoko groups: each series in a group is one season, numbered in Shoko's order, so its season and episode numbers often differ from TVDB's and TMDB's. Silo can still give those shows TVDB, TMDB and IMDb IDs, and the plain **AniList** connection maps episodes by those IDs and the season and episode number. For a Shoko VFS show that means the wrong AniList entry or progress whenever Shoko's group order differs from TVDB's or TMDB's.
+
+Use **AniList with Silo watched check** for profiles that watch a Shoko VFS library. With the Silo access it keeps, the plugin reads each episode's file names from Silo. Every VFS link name carries its AniDB anime as `[AniDB Anime=<id>]`, and a regular season's episode numbers are that anime's AniDB numbers:
+
+- **Exports** of a VFS episode map by its AniDB anime and episode through AniBridge, or ARM for a regular episode AniBridge does not cover. Specials in `Season 00` map as AniDB specials. Credits, trailers, parodies and other extras have no AniDB episode and are not sent. A VFS episode is never mapped by its show's TVDB, TMDB or IMDb ID, so one with no AniDB mapping is rejected.
+- **Imports** first read the profile's catalog to find its VFS shows: one episode's files per season name its AniDB anime. That list is kept for 6 hours and read again in the background. Until the first reading finishes, the import asks Silo to try again in a minute, and a large catalog can take a few minutes. AniList progress that maps to a VFS show by TVDB, TMDB or IMDb is dropped. Progress is instead imported through the AniDB anime, naming each VFS episode by its own TVDB, TMDB or IMDb episode ID, so Silo marks that episode or nothing. VFS episodes without their own IDs are not imported, and the sync's warnings count entries left with no episode to mark.
+
 AniList tokens last about a year. When AniList rejects a token, Silo keeps the profile's plays and its Watch Providers page says to reconnect AniList.
 
 ## AniList Sync page

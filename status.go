@@ -407,6 +407,9 @@ type importSummary struct {
 	states   int
 	ratings  int
 	unmapped []anilist.ListEntry
+	// shokoSkipped counts entries that only Shoko VFS shows matched by
+	// TVDB, TMDB or IMDb numbering, so they were not imported.
+	shokoSkipped int
 }
 
 func (s *statusStore) recordImport(ctx context.Context, userID int, summary importSummary, rating bool) {

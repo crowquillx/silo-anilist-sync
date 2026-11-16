@@ -13,6 +13,10 @@ import (
 )
 
 const requestTimeout = 5 * time.Second
+
+// catalogRequestTimeout bounds one catalog listing request, which returns
+// more than the watched check's item reads.
+const catalogRequestTimeout = 15 * time.Second
 const maxResponseBytes = 1 << 20
 
 type Kind int
@@ -63,7 +67,7 @@ type Client struct {
 
 func NewClient(config Config) *Client {
 	return &Client{config: config, http: &http.Client{
-		Timeout:       requestTimeout,
+		Timeout:       catalogRequestTimeout,
 		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 	}}
 }
@@ -139,16 +143,26 @@ func (c *Client) Played(ctx context.Context, mediaItemID string) (bool, error) {
 }
 
 func (c *Client) get(ctx context.Context, path string, target any) (int, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(c.config.BaseURL, "/")+path, nil)
+	return c.getJSON(ctx, path, nil, target, "watched verification", maxResponseBytes)
+}
+
+// getJSON reads one Silo response into target. purpose names the request in
+// the fixed error messages, and limit caps the body Silo may send.
+func (c *Client) getJSON(ctx context.Context, path string, query url.Values, target any, purpose string, limit int64) (int, error) {
+	address := strings.TrimRight(c.config.BaseURL, "/") + path
+	if len(query) > 0 {
+		address += "?" + query.Encode()
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, address, nil)
 	if err != nil {
-		return 0, &Error{InvalidConfig, "Silo verification server URL is invalid"}
+		return 0, &Error{InvalidConfig, "Silo server URL is invalid"}
 	}
 	req.Header.Set("Authorization", "Bearer "+c.config.APIKey)
 	req.Header.Set("X-Profile-Id", c.config.ProfileID)
 	req.Header.Set("Accept", "application/json")
 	response, err := c.http.Do(req)
 	if err != nil {
-		return 0, &Error{Temporary, "Silo watched verification request failed; try again"}
+		return 0, &Error{Temporary, "Silo " + purpose + " request failed; try again"}
 	}
 	defer response.Body.Close()
 	switch response.StatusCode {
@@ -160,20 +174,20 @@ func (c *Client) get(ctx context.Context, path string, target any) (int, error) 
 		_ = json.Unmarshal(body, target)
 		return response.StatusCode, nil
 	case http.StatusUnauthorized:
-		return response.StatusCode, &Error{InvalidCredential, "Silo verification API key was rejected; reconnect with a valid key"}
+		return response.StatusCode, &Error{InvalidCredential, "Silo API key was rejected; reconnect with a valid key"}
 	case http.StatusForbidden:
-		return response.StatusCode, &Error{PermissionDenied, "Silo denied watched verification for the selected profile"}
+		return response.StatusCode, &Error{PermissionDenied, "Silo denied " + purpose + " for the selected profile"}
 	case http.StatusTooManyRequests:
-		return response.StatusCode, &Error{RateLimited, "Silo watched verification reached its request limit; try again"}
+		return response.StatusCode, &Error{RateLimited, "Silo " + purpose + " reached its request limit; try again"}
 	default:
 		if response.StatusCode >= 500 || response.StatusCode == http.StatusRequestTimeout {
-			return response.StatusCode, &Error{Temporary, "Silo watched verification is temporarily unavailable"}
+			return response.StatusCode, &Error{Temporary, "Silo " + purpose + " is temporarily unavailable"}
 		}
-		return response.StatusCode, &Error{Permanent, "Silo rejected watched verification; check the server URL and profile"}
+		return response.StatusCode, &Error{Permanent, "Silo rejected " + purpose + "; check the server URL and profile"}
 	}
-	body, err := io.ReadAll(io.LimitReader(response.Body, maxResponseBytes+1))
-	if err != nil || len(body) > maxResponseBytes || json.Unmarshal(body, target) != nil {
-		return response.StatusCode, &Error{Temporary, "Silo returned an unreadable watched verification response"}
+	body, err := io.ReadAll(io.LimitReader(response.Body, limit+1))
+	if err != nil || int64(len(body)) > limit || json.Unmarshal(body, target) != nil {
+		return response.StatusCode, &Error{Temporary, "Silo returned an unreadable " + purpose + " response"}
 	}
 	return response.StatusCode, nil
 }

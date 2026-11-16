@@ -38,6 +38,13 @@ type server struct {
 
 	importsOnce sync.Once
 	imports     *importCache
+
+	// shokoItems remembers which episode items are Shoko VFS links, and
+	// shokoIndexes each verified connection's Shoko VFS shows. See shoko.go.
+	shokoItemsOnce   sync.Once
+	shokoItems       *shokoItemCache
+	shokoIndexesOnce sync.Once
+	shokoIndexes     *shokoIndexCache
 }
 
 func (s *server) importCache() *importCache {

@@ -24,11 +24,13 @@ func TestZeroStopVerifiesSiloWatchedState(t *testing.T) {
 		wantWrites   int
 		wantReads    int
 	}{
-		{"watched zero stop", "anilist-silo", true, 0, false, 1, 2},
+		// A verified stop that reaches AniList also reads the episode's
+		// files, to tell a Shoko VFS link from an ordinary file.
+		{"watched zero stop", "anilist-silo", true, 0, false, 1, 3},
 		{"unwatched zero stop", "anilist-silo", false, 0, false, 0, 2},
 		{"standard provider stays opt out", "anilist", true, 0, false, 0, 0},
 		{"partial stop stays partial", "anilist-silo", true, 100, false, 0, 0},
-		{"existing entry restriction", "anilist-silo", true, 0, true, 0, 2},
+		{"existing entry restriction", "anilist-silo", true, 0, true, 0, 3},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			reads, writes := 0, 0
@@ -42,6 +44,8 @@ func TestZeroStopVerifiesSiloWatchedState(t *testing.T) {
 					_, _ = w.Write([]byte(`{"profiles":[{"id":"profile-a"}]}`))
 				case "/api/v1/catalog/items/episode-tvdb-100-1-1":
 					_ = json.NewEncoder(w).Encode(map[string]any{"content_id": "episode-tvdb-100-1-1", "user_state": map[string]any{"played": tc.played}})
+				case "/api/v2/catalog/items/episode-tvdb-100-1-1/versions":
+					_, _ = w.Write([]byte(`{"items":[{"file_name":"Show - S01E01.mkv"}]}`))
 				default:
 					t.Errorf("unexpected Silo request %s", r.URL.Path)
 					w.WriteHeader(404)
